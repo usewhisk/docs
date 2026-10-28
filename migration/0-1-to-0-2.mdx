@@ -1,0 +1,511 @@
+---
+title: "Migrate from 0.1 to 0.2"
+sidebarTitle: "0.1 to 0.2"
+description: "Upgrade @usewhisk/core and @usewhisk/react from 0.1 to 0.2, which replace Circle App Kit with a direct CCTP V2 integration."
+---
+
+This page is for apps on `@usewhisk/core@0.1.0` or `@usewhisk/react@0.1.0`. Start by upgrading both packages and adding `viem`, which is now a peer dependency:
+
+```bash
+npm install @usewhisk/react@^0.2.0 @usewhisk/core@^0.2.0 viem@^2.57.5
+```
+
+Whisk 0.2 no longer uses Circle App Kit. It calls Circle's CCTP V2 contracts and the Iris API directly, through a new package, `@usewhisk/cctp@0.1.0`. A transfer's network now comes from its source chain, so the `mode` option is gone. Whisk 0.2 also adds Stellar and Starknet next to EVM chains and Solana, bound quotes, resumable transfers, theme presets and a balance with a Max button.
+
+Chain ids did not change. Every chain id from 0.1 works in 0.2.
+
+There are 16 breaking changes below. The [upgrade checklist](#upgrade-checklist) at the end lists the work in order.
+
+## Install
+
+`@usewhisk/core` only needs to be a direct dependency if you import from it. `@usewhisk/cctp` is installed for you as a dependency of `@usewhisk/core`.
+
+### Dependency changes
+
+| Package           | 0.1                                                 | 0.2                                                    |
+| ----------------- | --------------------------------------------------- | ------------------------------------------------------ |
+| `@usewhisk/core`  | depends on `@circle-fin/app-kit`                    | depends on `@usewhisk/cctp`; peer `viem` `>=2.57.5 <3` |
+| `@usewhisk/react` | peers `react`, `react-dom`, `@tanstack/react-query` | same peers, plus `viem` `>=2.57.5 <3`                  |
+
+Removed from the dependency tree:
+
+- `@circle-fin/app-kit`
+- `@circle-fin/adapter-viem-v2`
+- `@circle-fin/adapter-solana-kit`
+- `@solana/kit`
+- `nanoevents`
+
+If your app installed any of these only for Whisk, you can remove them.
+
+The Stellar and Starknet wallet libraries (`@creit.tech/stellar-wallets-kit`, `@starknet-io/get-starknet-core`, `@stellar/stellar-sdk`, `starknet`) are regular dependencies of `@usewhisk/react`. You do not install anything extra to use them. See [installation](/installation).
+
+## Breaking changes
+
+### 1. Chain ids are unchanged, and 19 were added
+
+`Chain` is still a union of Circle's chain name strings. All 37 ids from 0.1 exist in 0.2 with the same spelling. None were renamed or removed.
+
+0.2 adds these ids:
+
+- EVM mainnets: `Arc`, `Cronos`, `Edge`, `Injective`, `Morph`, `Pharos`, `Plasma`, `X_Layer`
+- EVM testnets: `Cronos_Testnet`, `Edge_Testnet`, `Injective_Testnet`, `Morph_Testnet`, `Pharos_Testnet`, `Plasma_Testnet`, `X_Layer_Testnet`
+- Stellar: `Stellar`, `Stellar_Testnet`
+- Starknet: `Starknet`, `Starknet_Sepolia`
+
+`ChainKind` was `"evm" | "solana"`. It is now `"evm" | "solana" | "stellar" | "starknet"`. A `switch` over it needs the two new cases:
+
+```ts
+import type { ChainKind } from "@usewhisk/react";
+
+export function walletLabel(kind: ChainKind): string {
+  switch (kind) {
+    case "evm":
+      return "EVM";
+    case "solana":
+      return "Solana";
+    case "stellar":
+      return "Stellar";
+    case "starknet":
+      return "Starknet";
+  }
+}
+```
+
+The `evm()` wallet factory cannot switch a wallet to the new `Cronos`, `Edge`, `Injective`, `Morph`, `Pharos`, `Plasma` and `X_Layer` ids or their testnets. See [chains](/chains).
+
+### 2. `mode` is removed
+
+In 0.1, `mode` (`"mainnet"` or `"testnet"`) was set on the config or inferred from `chains`. In 0.2 each transfer takes its network from its source chain.
+
+- `mode` is gone from `createWhisk` and `createWhiskConfig`.
+- `WhiskMode`, `inferMode` and `resolveMode` are removed.
+- `createDefaultResolver` no longer takes `mode`. It picks Sepolia or mainnet ENS from the destination chain's network.
+- A config may list mainnet and testnet chains together. `WhiskSend` offers only destinations on the same network as the selected source chain.
+- If a source and destination are on different networks, `quote` throws `NetworkMismatchError` before anything is signed.
+
+<CodeGroup>
+
+```tsx 0.1
+const config = createWhiskConfig({
+  wallets: [evm({ projectId })],
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  mode: "testnet",
+});
+```
+
+```tsx 0.2
+const config = createWhiskConfig({
+  wallets: [evm({ projectId })],
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+});
+```
+
+</CodeGroup>
+
+See [chains](/chains#network-comes-from-the-chain).
+
+### 3. App Kit, swap and the kit key are removed
+
+0.1 ran transfers through Circle App Kit and offered a swap tab that needed a Circle Console kit key. 0.2 moves USDC only, with CCTP V2.
+
+Removed from `@usewhisk/react`:
+
+- `WhiskSend` props: `kitKey`, `defaultTab`, `swapDefaultChain`, `swapDefaultTokenIn`, `swapDefaultTokenOut`, `onSwapSuccess`, `onSwapError`, `onSwapStateChange`
+- `SwapTab`, `SwapTabProps`, `WhiskSendTab`
+- `useWhiskSwap`, `UseWhiskSwapResult`, `SwapState`, `SwapInput`
+
+Removed from `@usewhisk/core`:
+
+- `engine.estimateSwap` and `engine.swap`
+- `SwapParams` (which held `kitKey`), `SwapEstimate`, `SwapResult`, `SwapSuccess`, `SwapFailure`
+- `fromAppKitFees`
+
+There is no kit key or app ID to configure in 0.2.
+
+### 4. `WhiskSend` props
+
+| 0.1                                                      | 0.2                                             |
+| -------------------------------------------------------- | ----------------------------------------------- |
+| `tabs?: ("transfer" \| "swap")[]`                        | `tabs?: ReadonlyArray<"send" \| "bridge">`      |
+| `onSuccess?: (result: { quote; finalTxHash? }) => void`  | `onSuccess?: (result: SendSuccess) => void`     |
+| `onError?: (error: Error) => void`                       | `onFailure?: (result: SendFailure) => void`     |
+| `onStateChange`                                          | removed                                         |
+| `onAmountChange`, `onRecipientChange`                    | removed                                         |
+| `onSourceChainChange`, `onDestinationChainChange`        | removed                                         |
+| `showFooter`, `className`                                | removed                                         |
+| `amount`, `recipient`, `sourceChain`, `destinationChain` | unchanged (each locks its field)                |
+| `defaultAmount`, `defaultRecipient`                      | unchanged                                       |
+| none                                                     | `defaultSourceChain`, `defaultDestinationChain` |
+| none                                                     | `title`, `description`                          |
+
+The 0.1 `"transfer"` tab covered same-chain sends and bridges. In 0.2 these are two tabs, `"send"` and `"bridge"`, and both show by default.
+
+`onSuccess` now receives the engine's `SendSuccess` (`finalTxHash`, `steps`, `metadata`), not the quote. `onFailure` receives a `SendFailure` with a typed `error`. An error thrown before the engine returns a result is shown in the widget and does not call `onFailure`.
+
+The widget always shows a "Powered by Whisk" badge.
+
+<CodeGroup>
+
+```tsx 0.1
+<WhiskSend
+  tabs={["transfer"]}
+  onSuccess={({ quote, finalTxHash }) => track(quote.amountOut, finalTxHash)}
+  onError={(error) => report(error)}
+  showFooter
+/>
+```
+
+```tsx 0.2
+<WhiskSend
+  onSuccess={(result) => track(result.finalTxHash)}
+  onFailure={(result) => report(result.error)}
+/>
+```
+
+</CodeGroup>
+
+See [WhiskSend](/widget/whisk-send).
+
+### 5. `WhiskProvider` theme
+
+| 0.1                             | 0.2                                                                                     |
+| ------------------------------- | --------------------------------------------------------------------------------------- |
+| `"light" \| "dark" \| "system"` | `"light" \| "dark" \| "auto"`, a named palette, a `WhiskTheme`, or `{ preset, tokens }` |
+| default `"system"`              | default `"light"`                                                                       |
+
+`"system"` is renamed `"auto"`. The default no longer follows the OS. To keep the 0.1 behavior, pass `theme="auto"`:
+
+```tsx
+<WhiskProvider config={config} theme="auto">
+  <WhiskSend />
+</WhiskProvider>
+```
+
+See [theming](/theming/overview).
+
+### 6. `feeBearer` defaults to `"sender"`
+
+In 0.1 the default was `"receiver"`: bridge fees came out of the amount, and the recipient got less than the payer entered. In 0.2 the default is `"sender"`: the payer covers the fees, and the recipient gets the amount entered. The payer's debit grows by the fees.
+
+<Warning>
+  This changes what payers are charged without any code change on your side. If
+  your prices already account for bridge fees, or recipients should keep paying
+  them, set `feeBearer: "receiver"`.
+</Warning>
+
+```tsx
+const config = createWhiskConfig({
+  wallets: [evm({ projectId })],
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  feeBearer: "receiver",
+});
+```
+
+See [quotes and fees](/concepts/quotes-and-fees).
+
+### 7. Custom fee split
+
+`feePolicy` still splits the fee 90% to your `recipient` and 10% elsewhere. In 0.1, App Kit sent the 10% to Arc. In 0.2 it goes to the Whisk treasury, exported as `WHISK_TREASURY_ADDRESS`. `feePolicy.bps` was swap only in 0.1 and is ignored in 0.2. Use `value`, a decimal USDC string such as `"0.25"`, which the payer pays on top of the transfer.
+
+### 8. USDC only
+
+0.1 used the `token` option for same-chain sends of other tokens, such as EURC or USDT. 0.2 moves USDC on every route, whatever `token` says: the `Token` type still lists the other symbols, but no route moves them. Remove any `token` setting other than `"USDC"`.
+
+### 9. `useWhisk` is a different hook
+
+In 0.1, `useWhisk()` returned a state machine: `{ state, actions, connected, address }`, with `actions.resolve`, `actions.quote`, `actions.send`, `actions.retry`, `actions.back` and `actions.reset`.
+
+In 0.2 it returns the engine and promise-based calls for the connected EVM wallet: `engine`, `adapter`, `address`, `isConnected`, `resolve`, `quote`, `send`, `isSending`, `lastResult`, `sendError` and `reset`. It signs with the EVM wallet only. For other ecosystems, use `useWhiskEngine` with `useSolanaAdapter`, `useStellarAdapter`, `useStarknetAdapter` or `useAdapterFor`.
+
+<CodeGroup>
+
+```tsx 0.1
+const { state, actions, connected } = useWhisk();
+
+await actions.resolve(input, "Base_Sepolia");
+// then actions.quote(recipient, amount, sourceChain) and actions.send()
+```
+
+```tsx 0.2
+import { useWhisk } from "@usewhisk/react";
+
+export function usePay() {
+  const { resolve, quote, send, isConnected } = useWhisk();
+
+  return async function pay(input: string) {
+    if (!isConnected) throw new Error("Connect an EVM wallet first.");
+    const recipient = await resolve(input, "Base_Sepolia");
+    const q = await quote({
+      sourceChain: "Arc_Testnet",
+      destinationChain: "Base_Sepolia",
+      recipient,
+      amount: "10",
+    });
+    return send({ quote: q });
+  };
+}
+```
+
+</CodeGroup>
+
+`reduce`, `initialState` and `initialSteps` are still exported from `@usewhisk/core` if you drive your own state machine. See [useWhisk](/hooks/use-whisk).
+
+### 10. Removed hooks and components
+
+| 0.1                                                                                                                               | 0.2                                                                                                         |
+| --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `useWhiskAdapter(chain)`                                                                                                          | `useAdapterFor()(chain)`, or `useEvmAdapter`, `useSolanaAdapter`, `useStellarAdapter`, `useStarknetAdapter` |
+| `useWhiskAccount`                                                                                                                 | no equivalent; read the wallet library directly (for EVM, wagmi's `useAccount`)                             |
+| `useChainBalance`                                                                                                                 | `engine.balance({ chain, address })`                                                                        |
+| `useManualMint`                                                                                                                   | `engine.resume`, `engine.resumeFromTx`, or `WhiskReceipt`                                                   |
+| `usePreflight`, `useTabLock`                                                                                                      | no equivalent                                                                                               |
+| `useWhiskSwap`, `SwapTab`                                                                                                         | removed with swap                                                                                           |
+| `Input`, `Field`, `FieldBoxSelect`, `Badge`, `ChainIcon`, `TokenIcon`, `TokenPicker`, `AccountChip`, `NetworkPill`, `BalanceLine` | removed                                                                                                     |
+
+`Button`, `Card`, `FieldBox`, `ChainPicker`, `StepRail`, `Banner` and `ConnectModal` are still exported, and `PoweredByWhisk` is new. Check your props against the 0.2 types if you use them directly. See [primitives](/widget/primitives).
+
+### 11. Wallet factories
+
+- `evm()` takes the same options: `chains`, `projectId`, `rpcUrls`, `appName`.
+- `solana()` drops `cluster` (use `network`) and `wallets`. Solana wallets are found through Wallet Standard, so legacy adapters are not passed in.
+- `stellar()` and `starknet()` are new.
+- `evm()` is no longer required. A config with only `solana()`, `stellar()` or `starknet()` is accepted.
+
+See [wallets](/wallets).
+
+### 12. Chain lookups
+
+Core's chain table is replaced by the registry in `@usewhisk/cctp`, re-exported from `@usewhisk/core` and `@usewhisk/react`.
+
+| 0.1                                      | 0.2                                                             |
+| ---------------------------------------- | --------------------------------------------------------------- |
+| `chainInfo(chain)`                       | `getChain(chain)`                                               |
+| `chainByEvmId(id)` (returns `undefined`) | `tryChainByEvmChainId(id)`, or `chainByEvmChainId(id)` (throws) |
+| `allChains()`                            | `CHAINS`                                                        |
+| `chainsByKind(kind)`                     | `CHAINS.filter((c) => c.ecosystem === kind)`                    |
+| `chainsByNetwork(network)`               | `chainsByNetwork(network)`, returns registry entries            |
+| `cctpDomainFor(chain)`                   | `getChain(chain).cctpDomain`                                    |
+| `chainForCctpDomain(domain)`             | `chainByDomain(domain, network)`                                |
+| `supportedTokensFor`, `tokenAddressFor`  | removed; `getChain(chain).usdc` for the USDC address            |
+| `ChainInfo`, `SupportedTokenAlias`       | `CctpChain`                                                     |
+
+Field names on an entry changed too: `chain` is `id`, `kind` is `ecosystem`, `nativeSymbol` is `nativeCurrency.symbol`, and `usdcAddress` is `usdc`. For the input pattern and hint (`addressRegex` and `addressHint` in 0.1), use `addressFormat(chain)`, which returns `{ pattern, hint }`. `explorerTxUrl` and `explorerAddressUrl` keep their signatures.
+
+```ts
+import {
+  CHAINS,
+  addressFormat,
+  chainByDomain,
+  chainByEvmChainId,
+  chainsByNetwork,
+  explorerTxUrl,
+  getChain,
+  tryChainByEvmChainId,
+  type CctpChain,
+} from "@usewhisk/react";
+
+const base: CctpChain = getChain("Base");
+console.log(base.id, base.ecosystem, base.nativeCurrency.symbol, base.usdc);
+console.log(chainByEvmChainId(8453).id, tryChainByEvmChainId(1)?.id);
+console.log(CHAINS.filter((c) => c.ecosystem === "solana").map((c) => c.id));
+console.log(chainsByNetwork("testnet").length);
+console.log(chainByDomain(6, "mainnet").id);
+const { pattern, hint } = addressFormat("Solana");
+console.log(pattern, hint, explorerTxUrl("Base", "0xabc"));
+```
+
+### 13. Core engine: `send` takes the quote
+
+This applies if you call `@usewhisk/core` directly.
+
+In 0.1, `send` took the quote parameters again plus the quote. In 0.2 it takes the quote the payer confirmed and reads the chains, recipient and amount from it.
+
+<CodeGroup>
+
+```ts 0.1
+const quote = await engine.quote({
+  sourceChain,
+  destinationChain,
+  recipient,
+  amount,
+  adapter,
+});
+const result = await engine.send({
+  sourceChain,
+  destinationChain,
+  recipient,
+  amount,
+  adapter,
+  quote,
+});
+```
+
+```ts 0.2
+const quote = await engine.quote({
+  sourceChain,
+  destinationChain,
+  recipient,
+  amount,
+  adapter,
+});
+const result = await engine.send({ quote, adapter });
+```
+
+</CodeGroup>
+
+`send` can now throw before signing. Handle both quote errors:
+
+```ts
+import { QuoteChangedError, QuoteExpiredError } from "@usewhisk/core";
+
+try {
+  const result = await engine.send({ quote, adapter });
+  console.log(result.kind);
+} catch (err) {
+  if (err instanceof QuoteChangedError) {
+    console.log("confirm", err.quote.amountIn);
+  } else if (err instanceof QuoteExpiredError) {
+    console.log("quote again");
+  } else {
+    throw err;
+  }
+}
+```
+
+`QuoteChangedError` carries the fresh quote as `err.quote`; show it to the payer and send it once they confirm. On `QuoteExpiredError`, call `engine.quote` again.
+
+Other engine changes:
+
+- `engine.retry` and `RetryParams` are removed. Use `engine.resume` or `engine.resumeFromTx`.
+- `QuoteParams` and `SendParams` take an optional `destinationAdapter`. A route whose mint Circle does not forward throws `RouteUnavailableError` with `reason: "destination_adapter_required"` until you pass one.
+- `SendFailure.raw` is Whisk's recovery snapshot, not App Kit's `BridgeResult`.
+- `Quote` gains `id`, `issuedAt`, `expiresAt`, `feeMode`, `subunits` and `plan`, and `amountBurned` is required. Code that builds a `Quote` by hand no longer type checks. Get quotes from `engine.quote`.
+
+See [core engine](/headless/core-engine).
+
+### 14. Wallet adapters
+
+This applies if you built a `WhiskAdapter` yourself.
+
+In 0.1, `WhiskAdapter` was `{ appKitAdapter, kind, address }`, wrapping an App Kit adapter. In 0.2 it is a union of `EvmAdapter`, `SolanaAdapter`, `StellarAdapter` and `StarknetAdapter`. Each one signs and submits the calls the engine builds. `@usewhisk/react` ships them as hooks (`useEvmAdapter`, `useSolanaAdapter`, `useStellarAdapter`, `useStarknetAdapter`), and `createWagmiEvmAdapter(config, address)` builds the EVM one outside React. See [wallet adapters](/hooks/wallet-adapters).
+
+### 15. Errors
+
+`WhiskErrorCode` has four new codes. An exhaustive `switch` over it needs them:
+
+| Code                | Class                   | When                                                                                   |
+| ------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
+| `NETWORK_MISMATCH`  | `NetworkMismatchError`  | source and destination are on different networks                                       |
+| `ROUTE_UNAVAILABLE` | `RouteUnavailableError` | a wallet is missing, the recipient cannot receive, or source and destination are equal |
+| `QUOTE_EXPIRED`     | `QuoteExpiredError`     | the quote is past `expiresAt`                                                          |
+| `QUOTE_CHANGED`     | `QuoteChangedError`     | fees rose past what the payer confirmed                                                |
+
+`RouteUnavailableError.reason` says which: `"source_adapter_required"`, `"destination_adapter_required"`, `"recipient_account_missing"` or `"same_chain"`.
+
+```ts
+import type { WhiskErrorCode } from "@usewhisk/react";
+
+export function message(code: WhiskErrorCode): string {
+  switch (code) {
+    case "NETWORK_MISMATCH":
+      return "Pick a source and destination on the same network.";
+    case "ROUTE_UNAVAILABLE":
+      return "Connect the wallet this route needs.";
+    case "QUOTE_EXPIRED":
+      return "The quote expired. Get a new one.";
+    case "QUOTE_CHANGED":
+      return "Fees went up. Confirm the new quote.";
+    default:
+      return "Something went wrong.";
+  }
+}
+```
+
+All four are thrown before anything is signed. `@usewhisk/react` re-exports all four classes, so a React app does not need to import `@usewhisk/core` for them. See [errors](/concepts/errors).
+
+### 16. In-flight transfers from 0.1
+
+0.1 saved failed bridges in `localStorage` as snapshots. 0.2 uses a new record format and ignores 0.1 snapshots. The 0.1 helpers (`saveInflight`, `loadInflight`, `clearInflight`, `listInflightSnapshots`, `serializeError`, `deserializeError`, `INFLIGHT_TTL_MS`, `STORAGE_PREFIX`, `InflightSnapshot`, `WalletKind`) are removed.
+
+<Warning>
+  A payer whose 0.1 bridge burned but never minted will not see it in the 0.2
+  widget's resume list. The USDC is not lost: finish the mint from the burn's
+  transaction hash, with the Finish transfer button in `WhiskReceipt` or with
+  `engine.resumeFromTx`.
+</Warning>
+
+```ts
+import { createWhisk, type WhiskAdapter } from "@usewhisk/core";
+
+declare const adapter: WhiskAdapter;
+declare const burnTxHash: string;
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+const result = await engine.resumeFromTx({
+  sourceChain: "Base_Sepolia",
+  txHash: burnTxHash,
+  destinationAdapter: adapter,
+});
+console.log(result.kind);
+```
+
+`destinationAdapter` is the wallet that signs the mint. Leave it out when Circle forwards the mint on that route. See [recovery](/concepts/recovery) and [WhiskReceipt](/widget/whisk-receipt).
+
+## New in 0.2
+
+- **Bound quotes.** `send` signs exactly the fees in the quote the payer saw. A quote lasts 60 seconds. `WhiskSend` refreshes it before it expires and asks the payer to confirm again when fees rise.
+- **Resumable transfers.** Every bridge is saved in an `InflightStore` from before the wallet signs until the mint. `WhiskProvider` uses `localStorage` by default (`createBrowserInflightStore`); pass `inflightStore` to change it. `engine.inflight()`, `engine.resume(record)`, `engine.resumeFromTx(...)` and `engine.dismiss(id)` manage them. `WhiskSend` lists unfinished transfers with Resume and Dismiss, and `ResumeList` is exported on its own.
+- **Receipts.** `WhiskReceipt` and `useReceipt` show a transfer's status from Iris.
+- **More ecosystems.** Stellar and Starknet, through `stellar()` and `starknet()`, next to EVM and Solana, on mainnet and testnet.
+- **Theme presets.** `theme` takes `"light"`, `"dark"`, `"auto"`, `"wine"`, `"indigo"`, `"emerald"`, `"monochrome"`, a full `WhiskTheme`, or `{ preset, tokens }`. `themePresets`, `getThemePreset` and `resolveTheme` are exported.
+- **Balance and Max.** `engine.balance({ chain, address })` and `engine.maxSendable(params)` read the payer's USDC on EVM chains (`null` on Solana, Stellar and Starknet). `WhiskSend` shows the balance with a Max button.
+- **Typed errors.** The new error classes above, with `RouteUnavailableError.reason` for the cause.
+- **Refunds and metadata.** `engine.refund` and `useRefund` send funds back to a payer. `SendParams.metadata` and `WhiskConfig.defaultMetadata` (on `createWhisk`) tag transfers. See [refunds](/flows/refunds) and [metadata](/flows/metadata).
+- **Webhook signing.** `signWebhook` and `verifyWebhook` in `@usewhisk/core`, for server code.
+- **Amount helpers.** `parseUsdcAmount` and `formatUsdcAmount` convert between decimal strings and `bigint` subunits. See [amounts and units](/concepts/amounts-and-units).
+
+## Upgrade checklist
+
+<Steps>
+  <Step title="Install">
+    Install `@usewhisk/react@^0.2.0`, `@usewhisk/core@^0.2.0` if you import it,
+    and `viem@^2.57.5`.
+  </Step>
+  <Step title="Remove mode">
+    Remove `mode` from `createWhiskConfig` and `createWhisk`, and from
+    `createDefaultResolver`.
+  </Step>
+  <Step title="Remove swap">
+    Remove `kitKey`, the swap props, `SwapTab` and `useWhiskSwap`.
+  </Step>
+  <Step title="Update WhiskSend">
+    Rename `onError` to `onFailure`, update `onSuccess`, and change `tabs` to
+    `"send"` and `"bridge"`.
+  </Step>
+  <Step title="Update the theme">
+    Change `theme="system"` to `theme="auto"`, or pass `"auto"` if you relied on
+    the old default.
+  </Step>
+  <Step title="Decide who pays fees">
+    Set `feeBearer: "receiver"` if recipients should keep paying bridge fees.
+  </Step>
+  <Step title="Replace chain helpers">
+    Replace removed chain helpers with `getChain`, `CHAINS` and
+    `chainByEvmChainId`.
+  </Step>
+  <Step title="Pass the quote">
+    Rewrite `useWhisk` callers and direct `engine.send` calls to pass the quote.
+  </Step>
+  <Step title="Handle the new errors">
+    Handle `QuoteChangedError`, `QuoteExpiredError`, `NetworkMismatchError` and
+    `RouteUnavailableError`.
+  </Step>
+  <Step title="Finish 0.1 transfers">
+    Finish any 0.1 transfer that burned but never minted, using its burn hash.
+  </Step>
+  <Step title="Test on testnet">
+    Run a testnet transfer end to end, on every route you offer, before
+    shipping.
+  </Step>
+</Steps>

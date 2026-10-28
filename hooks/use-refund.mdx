@@ -1,0 +1,261 @@
+---
+title: useRefund
+description: Send USDC back to the payer of an earlier transfer from the connected merchant wallet.
+---
+
+`useRefund` sends a refund from the connected EVM wallet, which acts as the
+merchant, to the wallet that paid you.
+
+```tsx RefundButton.tsx
+import { useRefund } from "@usewhisk/react";
+
+export function RefundButton() {
+  const { refund, isPending, data, error } = useRefund();
+
+  return (
+    <div>
+      <button
+        disabled={isPending}
+        onClick={() =>
+          refund({
+            originalTxHash: "0x9f2c...e41a",
+            originalDestinationChain: "Arc_Testnet",
+            refundDestinationChain: "Base_Sepolia",
+            originalSenderAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+            amount: "10.00",
+            reason: "customer_request",
+          })
+        }
+      >
+        {isPending ? "Refunding..." : "Refund 10.00 USDC"}
+      </button>
+      {error ? <p role="alert">{error.message}</p> : null}
+      {data?.kind === "failure" ? (
+        <p role="alert">{data.error.message}</p>
+      ) : null}
+      {data?.kind === "success" ? <p>Refunded.</p> : null}
+    </div>
+  );
+}
+```
+
+## What a refund is
+
+A refund in Whisk is a new transfer in the other direction. Nothing about the
+original payment is reversed or touched: CCTP burns and mints cannot be
+undone. The refund is an ordinary send or bridge from the merchant wallet, on
+the chain where the payment landed, to the payer's address, on the chain you
+choose.
+
+That has consequences for the money:
+
+- **The merchant wallet pays.** It needs the USDC on
+  `originalDestinationChain`, plus gas there (USDC on Arc).
+- **The merchant pays the bridge fees.** With the default
+  `feeBearer: "sender"`, the burn is sized up so the payer receives the full
+  `amount`. With `"receiver"`, the payer receives `amount` less the fees.
+- **Your own fee applies too.** If the provider config has a `feePolicy`, the
+  refund quote includes it, and the merchant wallet pays it like any payer
+  would (90% to your fee recipient, 10% to the Whisk treasury). The result's
+  `customFee` says whether it was paid.
+- **Whisk does not check the original payment.** It does not look up
+  `originalTxHash`, compare `amount` with what was paid, or remember earlier
+  refunds. Partial refunds work, and so does refunding the same order twice.
+  Keep the refund state in your own order records and check it before calling.
+
+## Correlation metadata
+
+The result's `metadata` links the refund to the payment it returns. Whisk adds
+two reserved keys on top of your own metadata:
+
+| Constant            | Key                | Value                            |
+| ------------------- | ------------------ | -------------------------------- |
+| `REFUND_OF_TX_KEY`  | `__refundOfTxHash` | `originalTxHash`, trimmed        |
+| `REFUND_REASON_KEY` | `__refundReason`   | `reason`, only when you pass one |
+
+Your own `metadata` cannot use keys that start with `__`; the refund is refused
+with a `ConfigError` before anything is quoted.
+
+```ts useRefundOrder.ts
+import {
+  REFUND_OF_TX_KEY,
+  REFUND_REASON_KEY,
+  useRefund,
+} from "@usewhisk/react";
+
+type Order = {
+  id: string;
+  paymentTxHash: string;
+  payer: string;
+  amount: string;
+};
+
+export function useRefundOrder() {
+  const { refundAsync } = useRefund();
+
+  return async function refundOrder(order: Order) {
+    const result = await refundAsync({
+      originalTxHash: order.paymentTxHash,
+      originalDestinationChain: "Arc_Testnet",
+      refundDestinationChain: "Base_Sepolia",
+      originalSenderAddress: order.payer,
+      amount: order.amount,
+      reason: "out_of_stock",
+      metadata: { orderId: order.id },
+      listeners: { onStep: (step) => console.log(step.name, step.state) },
+    });
+
+    if (result.kind === "failure") throw result.error;
+
+    // { orderId: "...", __refundOfTxHash: "0x...", __refundReason: "out_of_stock" }
+    console.log(
+      result.metadata?.[REFUND_OF_TX_KEY],
+      result.metadata?.[REFUND_REASON_KEY],
+    );
+    await markRefunded(order.id, result.finalTxHash);
+  };
+}
+```
+
+## Variables
+
+`refund` and `refundAsync` take a `UseRefundVariables`: a `RefundInput` plus
+optional `listeners`.
+
+<ParamField path="originalTxHash" type="string" required>
+  Source-chain tx hash of the payment being refunded. Stored as
+  `__refundOfTxHash`.
+</ParamField>
+
+<ParamField path="originalDestinationChain" type="Chain" required>
+  Where the merchant received the payment. The refund is sent from here.
+</ParamField>
+
+<ParamField path="refundDestinationChain" type="Chain" required>
+  Where the payer gets the refund, usually the chain they paid from. Equal to
+  `originalDestinationChain` for a same-chain refund.
+</ParamField>
+
+<ParamField path="originalSenderAddress" type="string" required>
+  The payer's address on `refundDestinationChain`.
+</ParamField>
+
+<ParamField path="amount" type="string" required>
+  Decimal USDC, such as `"10.50"`. Must be positive. May be less than the
+  original payment.
+</ParamField>
+
+<ParamField path="reason" type="string">
+  At most 256 characters. Stored as `__refundReason`.
+</ParamField>
+
+<ParamField path="metadata" type="WhiskMetadata">
+  Your own correlation keys. No `__` prefixes.
+</ParamField>
+
+<ParamField path="listeners" type="SendListeners">
+  `onStep` and `onBurnSubmitted`, as for a send.
+</ParamField>
+
+## Result
+
+<ResponseField name="refund" type="(input: UseRefundVariables) => void">
+  Starts a refund without returning a promise. The outcome lands on `data` or
+  `error`.
+</ResponseField>
+
+<ResponseField
+  name="refundAsync"
+  type="(input: UseRefundVariables) => Promise<RefundResult>"
+>
+  Starts a refund and resolves to its `RefundResult`. Rejects when the refund
+  throws.
+</ResponseField>
+
+<ResponseField name="data" type="RefundResult | null">
+  The latest result. `RefundResult` is a `SendResult`: branch on `data.kind`.
+</ResponseField>
+
+<ResponseField name="error" type="Error | null">
+  Set when the refund threw: no wallet connected, invalid input, a quote that
+  could not be built, or a network failure.
+</ResponseField>
+
+<ResponseField name="isPending" type="boolean">
+  `true` while a refund is in flight.
+</ResponseField>
+
+<ResponseField name="reset" type="() => void">
+  Clears `data` and `error`.
+</ResponseField>
+
+As with a send, a thrown error means nothing was signed. A `data.kind` of
+`"failure"` after the burn means the merchant's USDC left and the mint is
+still due; the refund sits in the in-flight store and can be finished with
+`engine.resume` (see [recovery](/concepts/recovery)).
+
+## Refunds from or to other ecosystems
+
+`useRefund` uses the connected EVM wallet as `merchantAdapter` and has no way to
+pass a `destinationAdapter`. That covers refunds out of an EVM chain into one
+where Circle forwards the mint. For a merchant wallet on Solana, Stellar or
+Starknet, or a refund into a chain that needs the destination wallet to sign
+the mint, call `engine.refund` yourself:
+
+```ts useCrossEcosystemRefund.ts
+import {
+  useAdapterFor,
+  useWhiskEngine,
+  type RefundInput,
+} from "@usewhisk/react";
+
+export function useCrossEcosystemRefund() {
+  const engine = useWhiskEngine();
+  const adapterFor = useAdapterFor();
+
+  return async function refund(input: RefundInput) {
+    const merchantAdapter = adapterFor(input.originalDestinationChain);
+    if (!merchantAdapter)
+      throw new Error("Connect the wallet that received the payment.");
+    const destinationAdapter = adapterFor(input.refundDestinationChain);
+
+    return engine.refund({
+      ...input,
+      merchantAdapter,
+      ...(destinationAdapter && { destinationAdapter }),
+    });
+  };
+}
+```
+
+## Building the metadata yourself
+
+`validateRefundInput` and `buildRefundMetadata` are the two steps
+`engine.refund` runs before quoting. Use them to check refund input in a form,
+or to tag a payout you send some other way with the same keys.
+
+```ts
+import { buildRefundMetadata, validateRefundInput } from "@usewhisk/react";
+
+const plan = validateRefundInput({
+  originalTxHash: "0x9f2c...e41a",
+  originalDestinationChain: "Arc_Testnet",
+  refundDestinationChain: "Base_Sepolia",
+  originalSenderAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  amount: "4.50",
+  reason: "partial_return",
+});
+
+const metadata = buildRefundMetadata(plan.originalTxHash, plan.reason, {
+  orderId: "ord_123",
+});
+// { orderId: "ord_123", __refundOfTxHash: "0x9f2c...e41a", __refundReason: "partial_return" }
+```
+
+`validateRefundInput` throws a `ConfigError` for an empty tx hash or address,
+an amount that is not a positive decimal, a reason over 256 characters, or
+invalid metadata. Chains are checked later, when the refund is quoted.
+`buildRefundMetadata` does not merge an engine's `defaultMetadata`; pass your
+metadata already merged if you need it.
+
+See [refunds](/flows/refunds) for the end-to-end merchant flow.

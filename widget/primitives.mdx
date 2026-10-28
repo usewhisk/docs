@@ -1,0 +1,230 @@
+---
+title: Primitives
+description: The building blocks WhiskSend is made of, exported so custom payment UIs can match the widget's look and theme.
+---
+
+`WhiskSend` and `WhiskReceipt` are built from a handful of small components. They are exported so you can build your own flow, usually on top of [`useWhisk`](/hooks/use-whisk) or the engine, and keep the same styling, theme and attribution.
+
+```tsx TopUp.tsx
+import { useState } from "react";
+import {
+  Banner,
+  Button,
+  Card,
+  ChainPicker,
+  FieldBox,
+  PoweredByWhisk,
+  type Chain,
+} from "@usewhisk/react";
+
+const CHAINS: Chain[] = ["Base_Sepolia", "Arc_Testnet", "Ethereum_Sepolia"];
+
+export function TopUp() {
+  const [chain, setChain] = useState<Chain>("Base_Sepolia");
+  const [amount, setAmount] = useState("");
+  return (
+    <Card>
+      <FieldBox
+        label="Amount"
+        variant="amount"
+        inputMode="decimal"
+        placeholder="0.00"
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+        suffix={
+          <ChainPicker value={chain} onChange={setChain} chains={CHAINS} />
+        }
+        help="Paid in USDC"
+      />
+      <Banner variant="warning">
+        Testnet only. These funds have no value.
+      </Banner>
+      <Button disabled={!amount}>Top up</Button>
+      <PoweredByWhisk />
+    </Card>
+  );
+}
+```
+
+Every primitive styles itself with `whisk-*` class names from `@usewhisk/react/styles.css`, which read the `--whisk-*` variables. Two things follow:
+
+- Import `styles.css` once, and render primitives inside a [`WhiskProvider`](/widget/whisk-provider). The variables are scoped to its `[data-whisk]` element, so outside it the components lose their colors.
+- [Theming](/theming/overview) applies to them exactly as it does to `WhiskSend`.
+
+Each component also takes a `className` (except `PoweredByWhisk` and `StepRail`), which is added after the Whisk classes.
+
+## Card
+
+The outer surface: background, border, radius and padding from the theme.
+
+| Prop       | Type                             | Default | Description                              |
+| ---------- | -------------------------------- | ------- | ---------------------------------------- |
+| `...props` | `HTMLAttributes<HTMLDivElement>` |         | Passed to the `<div>`. Forwards its ref. |
+
+## Button
+
+A `<button>` in one of four styles. It defaults to `type="button"`, so it never submits a surrounding form by accident. Forwards its ref.
+
+| Prop        | Type                                               | Default     | Description                             |
+| ----------- | -------------------------------------------------- | ----------- | --------------------------------------- |
+| `variant`   | `"primary" \| "secondary" \| "ghost" \| "outline"` | `"primary"` | `primary` fills with `--whisk-primary`. |
+| `size`      | `"sm" \| "md"`                                     | `"md"`      |                                         |
+| `iconStart` | `ReactNode`                                        |             | Rendered before the label.              |
+| `iconEnd`   | `ReactNode`                                        |             | Rendered after the label.               |
+| `...props`  | `ButtonHTMLAttributes<HTMLButtonElement>`          |             | Passed to the `<button>`.               |
+
+The types `ButtonProps`, `ButtonVariant` and `ButtonSize` are exported.
+
+## Banner
+
+A status line for results, warnings and errors. An `error` banner gets `role="alert"`, so screen readers announce it; the others get `role="status"`. Pass `role` to override.
+
+| Prop       | Type                             | Default  | Description                                                                                     |
+| ---------- | -------------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `variant`  | `"info" \| "warning" \| "error"` | `"info"` | `info` is neutral; `warning` and `error` tint with `--whisk-warning` and `--whisk-destructive`. |
+| `icon`     | `ReactNode`                      |          | Rendered before the text.                                                                       |
+| `action`   | `ReactNode`                      |          | Rendered after the text, such as a retry button.                                                |
+| `...props` | `HTMLAttributes<HTMLDivElement>` |          | Passed to the `<div>`.                                                                          |
+
+```tsx Expired.tsx
+import { Banner, Button } from "@usewhisk/react";
+
+export function Expired({ onRetry }: { onRetry: () => void }) {
+  return (
+    <Banner
+      variant="error"
+      action={
+        <Button variant="ghost" size="sm" onClick={onRetry}>
+          Retry
+        </Button>
+      }
+    >
+      The quote expired before it was signed.
+    </Banner>
+  );
+}
+```
+
+## FieldBox
+
+A labelled `<input>` with a slot after it, help text under it, and an error state. It wires the label to the input and the help or error text to `aria-describedby`. Forwards its ref to the `<input>`.
+
+| Prop       | Type                                                   | Default     | Description                                                                  |
+| ---------- | ------------------------------------------------------ | ----------- | ---------------------------------------------------------------------------- |
+| `label`    | `ReactNode`                                            | required    | The field label.                                                             |
+| `suffix`   | `ReactNode`                                            |             | Rendered inside the field after the input: a chain picker, a unit, a button. |
+| `help`     | `ReactNode`                                            |             | Text under the field.                                                        |
+| `error`    | `ReactNode`                                            |             | Marks the field invalid and replaces `help`. Announced as an alert.          |
+| `variant`  | `"default" \| "amount" \| "mono"`                      | `"default"` | `amount` enlarges the input; `mono` uses `--whisk-font-mono`, for addresses. |
+| `...props` | `InputHTMLAttributes<HTMLInputElement>` without `size` |             | Passed to the `<input>`.                                                     |
+
+```tsx RecipientField.tsx
+import { useState } from "react";
+import { Button, FieldBox } from "@usewhisk/react";
+
+export function RecipientField() {
+  const [value, setValue] = useState("");
+  const invalid = value !== "" && !value.startsWith("0x");
+  return (
+    <FieldBox
+      label="Recipient"
+      variant="mono"
+      placeholder="0x…"
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      error={invalid ? "Enter an EVM address." : undefined}
+      suffix={
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void navigator.clipboard.readText().then(setValue)}
+        >
+          Paste
+        </Button>
+      }
+    />
+  );
+}
+```
+
+`FieldBox` holds no state. For amounts, keep the value as the decimal string the payer typed and convert with `parseUsdcAmount` only when you need subunits. See [amounts and units](/concepts/amounts-and-units).
+
+## ChainPicker
+
+A dropdown of chains, showing each chain's label. Its list renders into the provider's portal, so it keeps the theme.
+
+| Prop        | Type                     | Default   | Description                     |
+| ----------- | ------------------------ | --------- | ------------------------------- |
+| `value`     | `Chain`                  | required  | The selected chain.             |
+| `onChange`  | `(chain: Chain) => void` | required  | Called with the picked chain.   |
+| `chains`    | `ReadonlyArray<Chain>`   | required  | The chains to offer, in order.  |
+| `ariaLabel` | `string`                 | `"Chain"` | Accessible name of the trigger. |
+| `disabled`  | `boolean`                |           |                                 |
+| `className` | `string`                 |           | Added to the trigger.           |
+
+It does not filter by network. If you let the payer pick both ends of a bridge, offer only destinations on the source chain's network; `chainsByNetwork` and `getChain(chain).network` from `@usewhisk/react` help with that.
+
+## StepRail
+
+An ordered list of a transfer's steps, with a check for each finished step, a cross for a failed one, and the first `pending` step marked active. It takes the `Step[]` the engine emits through `onStep`, returns in `SendResult.steps`, or that `useReceipt` derives.
+
+| Prop     | Type                                | Default  | Description                       |
+| -------- | ----------------------------------- | -------- | --------------------------------- |
+| `steps`  | `ReadonlyArray<Step>`               | required | The steps to draw, in order.      |
+| `labels` | `Partial<Record<StepName, string>>` |          | Replaces the default step labels. |
+
+Default labels: `approve` "Approve USDC", `transfer` "Transfer", `burn` "Burn on source chain", `fetchAttestation` "Confirm attestation", `mint` "Mint on destination". A mint relayed by Circle's Forwarder gets " (forwarder)" after its label.
+
+To show live progress, collect steps as the engine reports them:
+
+```tsx Progress.tsx
+import { useState } from "react";
+import {
+  StepRail,
+  useWhiskEngine,
+  type Quote,
+  type Step,
+  type WhiskAdapter,
+} from "@usewhisk/react";
+
+export function Progress({
+  quote,
+  adapter,
+}: {
+  quote: Quote;
+  adapter: WhiskAdapter;
+}) {
+  const engine = useWhiskEngine();
+  const [steps, setSteps] = useState<Step[]>([]);
+
+  async function send() {
+    await engine.send(
+      { quote, adapter },
+      {
+        onStep: (step) =>
+          setSteps((prev) => {
+            const i = prev.findIndex((s) => s.name === step.name);
+            return i === -1
+              ? [...prev, step]
+              : prev.map((s, j) => (j === i ? step : s));
+          }),
+      },
+    );
+  }
+
+  return (
+    <>
+      <button onClick={() => void send()}>Send</button>
+      <StepRail steps={steps} labels={{ mint: "Deliver to recipient" }} />
+    </>
+  );
+}
+```
+
+`engine.send` can also throw before any step starts, for example when the quote expired or fees rose. Handle that as shown in [`useWhisk`](/hooks/use-whisk).
+
+## PoweredByWhisk
+
+The "Powered by Whisk" link that `WhiskSend` and `WhiskReceipt` show at the bottom. It takes no props. Its layout and visibility are set as inline `!important` styles, so host CSS cannot hide it; its colors still come from the theme (`--whisk-fg-muted`, `--whisk-fg`, `--whisk-font`).
+
+Include it in custom widgets built from these primitives.

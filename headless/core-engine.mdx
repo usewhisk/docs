@@ -1,0 +1,350 @@
+---
+title: The core engine
+description: Use @usewhisk/core without React to resolve, quote, send, and finish USDC transfers with your own adapter.
+---
+
+`@usewhisk/core` is the engine under the React widget. It has no React, wagmi or
+DOM dependency, so it runs in a script, a server, a worker, or another
+framework.
+
+```ts
+import { createWhisk } from "@usewhisk/core";
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+const recipient = await engine.resolve(
+  "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  "Arc_Testnet",
+);
+console.log(recipient.address);
+```
+
+```bash
+pnpm add @usewhisk/core viem
+```
+
+`viem` is a peer dependency. `@usewhisk/cctp`, the protocol layer with the chain
+registry and Circle's contracts, comes with core.
+
+## The flow
+
+1. `createWhisk(config)` builds an engine for a list of chains. Only `chains`
+   is required. Mainnet or testnet follows from the chain ids you list; a
+   bridge between a mainnet and a testnet chain is refused with
+   `NetworkMismatchError`.
+2. `engine.resolve(input, chain)` turns an address (or a name, with a
+   resolver that knows names) into a `ResolvedRecipient`.
+3. `engine.quote(params)` prices the transfer for a given payer adapter. Show
+   `amountIn` (what the payer is debited) and `amountOut` (the least the
+   recipient gets) before the payer confirms.
+4. `engine.send({ quote, adapter }, listeners)` signs exactly that quote.
+
+The engine signs nothing itself. Every write goes through an adapter you pass
+in, which wraps your wallet or key.
+
+## A complete script
+
+The adapter turns a viem `WalletClient` into an `EvmAdapter`. It is pinned to
+the wallet's chain, which suits a server key; a browser wallet would call
+`wallet.switchChain` instead (see [Vue](/headless/vue)).
+
+```ts adapter.ts
+import {
+  createPublicClient,
+  http,
+  type Account,
+  type Chain as ViemChain,
+  type Transport,
+  type WalletClient,
+} from "viem";
+import { toWhiskError, WrongChainError, type EvmAdapter } from "@usewhisk/core";
+
+export function toEvmAdapter(
+  wallet: WalletClient<Transport, ViemChain, Account>,
+  rpcUrl?: string,
+): EvmAdapter {
+  const publicClient = createPublicClient({
+    chain: wallet.chain,
+    transport: http(rpcUrl),
+  });
+
+  return {
+    kind: "evm",
+    address: wallet.account.address,
+
+    async getChainId() {
+      return wallet.getChainId();
+    },
+
+    async switchChain(chainId) {
+      if (chainId !== wallet.chain.id) {
+        throw new WrongChainError(String(chainId));
+      }
+    },
+
+    async sendCalls(calls, options) {
+      const hashes: `0x${string}`[] = [];
+      for (const [index, call] of calls.entries()) {
+        try {
+          const hash = await wallet.sendTransaction({
+            to: call.to,
+            data: call.data,
+            value: call.value,
+            ...(call.maxFeePerGas !== undefined && {
+              maxFeePerGas: call.maxFeePerGas,
+            }),
+            ...(call.maxPriorityFeePerGas !== undefined && {
+              maxPriorityFeePerGas: call.maxPriorityFeePerGas,
+            }),
+          });
+          hashes.push(hash);
+          options?.onSubmitted?.(hash, index);
+          // The burn spends the approve's allowance, so wait for each call to land.
+          const receipt = await publicClient.waitForTransactionReceipt({
+            hash,
+            confirmations: 2,
+          });
+          if (receipt.status === "reverted") {
+            throw toWhiskError(
+              new Error(`Reverted: ${hash}`),
+              "Transaction reverted on-chain.",
+              "reverted_onchain",
+            );
+          }
+        } catch (cause) {
+          throw toWhiskError(cause, "Failed to submit transaction.");
+        }
+      }
+      return { hashes };
+    },
+
+    async waitForReceipt(hash) {
+      try {
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        return {
+          status: receipt.status === "success" ? "success" : "reverted",
+          blockNumber: receipt.blockNumber,
+        };
+      } catch (cause) {
+        throw toWhiskError(cause, "Failed waiting for receipt.");
+      }
+    },
+  };
+}
+```
+
+The script reads the balance, works out the largest amount the wallet can
+send, quotes 1.00 USDC from Base Sepolia to Arc Testnet, and sends it.
+
+```ts send.ts
+import { createWalletClient, http, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { baseSepolia } from "viem/chains";
+import {
+  createWhisk,
+  formatUsdcAmount,
+  QuoteChangedError,
+} from "@usewhisk/core";
+import { toEvmAdapter } from "./adapter.js";
+
+const account = privateKeyToAccount(process.env.PRIVATE_KEY as Hex);
+const wallet = createWalletClient({
+  account,
+  chain: baseSepolia,
+  transport: http(),
+});
+const adapter = toEvmAdapter(wallet);
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+const balance = await engine.balance({
+  chain: "Base_Sepolia",
+  address: adapter.address,
+});
+console.log(
+  `Balance: ${balance === null ? "unknown" : formatUsdcAmount(balance)} USDC`,
+);
+
+const recipient = await engine.resolve(process.env.TO ?? "", "Arc_Testnet");
+const route = {
+  sourceChain: "Base_Sepolia",
+  destinationChain: "Arc_Testnet",
+  recipient,
+  adapter,
+} as const;
+
+const max = await engine.maxSendable(route);
+console.log(`Can send up to ${max?.amount ?? "?"} USDC`);
+
+let quote = await engine.quote({ ...route, amount: "1.00" });
+console.log(
+  `Pay ${quote.amountIn}, recipient gets at least ${quote.amountOut}, fees ${quote.fees.total}`,
+);
+
+const listeners = {
+  onStep: (step: { name: string; state: string; txHash?: string }) =>
+    console.log(`${step.name}: ${step.state}`, step.txHash ?? ""),
+  onBurnSubmitted: (txHash: string) => console.log(`Burn submitted: ${txHash}`),
+};
+
+let result;
+try {
+  result = await engine.send(
+    { quote, adapter, metadata: { orderId: "ord_123" } },
+    listeners,
+  );
+} catch (err) {
+  if (!(err instanceof QuoteChangedError)) throw err;
+  console.log(`Fees rose. New total: ${err.quote.amountIn} USDC`);
+  quote = err.quote;
+  result = await engine.send(
+    { quote, adapter, metadata: { orderId: "ord_123" } },
+    listeners,
+  );
+}
+
+if (result.kind === "success") {
+  console.log(`Delivered. Mint tx: ${result.finalTxHash ?? "not reported"}`);
+} else {
+  console.error(`${result.error.code}: ${result.error.message}`);
+}
+```
+
+Run it with `PRIVATE_KEY=0x... TO=0x... npx tsx send.ts` from a package with
+`"type": "module"`, since the script uses top-level `await`. The wallet needs
+testnet USDC on Base Sepolia and Base Sepolia ETH for gas. On Arc, gas is paid in
+USDC from the same balance.
+
+### What the adapter has to do
+
+- **`sendCalls`** submits the calls in order and waits for each to confirm
+  before the next. A bridge sends `approve` and then the burn, and the burn
+  reverts if it is estimated before the approval lands. Two confirmations
+  between calls guard against an RPC that is a block behind.
+- **Pass `maxFeePerGas` and `maxPriorityFeePerGas` through** when the engine
+  sets them. Arc drops transactions below its 20 gwei base fee floor.
+- **Call `options.onSubmitted`** with each hash as soon as you have it. The
+  engine records the burn hash from it, which is what makes a transfer
+  recoverable after a crash.
+- **Throw `WhiskError`s.** The engine does not reclassify errors, so wrap
+  failures with `toWhiskError` and a wrong chain with `WrongChainError`.
+- **Atomic batches are optional.** With a `feePolicy`, the engine asks
+  `supportsAtomicBatch(chainId)` and, on yes, sends the burn and the fee in one
+  `sendCalls` with `atomic: true`. An adapter that implements it must land
+  those calls all or nothing, or throw
+  `WalletCapabilityError("atomic_unsupported", ...)` before sending anything.
+  Leave it out, as above, and the fee is sent as separate calls once the burn
+  has landed.
+
+## Send results
+
+`send` refuses before anything is signed by **throwing**. The errors to expect:
+
+| Error                      | When                                                            |
+| -------------------------- | --------------------------------------------------------------- |
+| `QuoteExpiredError`        | More than 60 seconds since the quote was issued                 |
+| `QuoteChangedError`        | Circle's fees rose past the quote; `error.quote` is a fresh one |
+| `InsufficientBalanceError` | The EVM balance cannot cover `amountIn` plus, on Arc, gas       |
+| `ConfigError`              | Invalid metadata                                                |
+
+Once the wallet is involved, `send` **returns** a `SendResult`. On
+`kind: "success"` the recipient has the USDC; `finalTxHash` is the mint (or the
+same-chain transfer) when known. On `kind: "failure"`, check `result.steps`: if
+the `burn` step succeeded, the USDC left the payer and the mint is still due.
+Finish it with `resume`. With a `feePolicy`, both kinds carry `customFee`,
+which says whether the merchant fee was paid; see [when the fee is
+paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+The listeners:
+
+- `onStep(step)` fires on each step change: `approve`, then `transfer` for a
+  same-chain send, or `burn`, `fetchAttestation` and `mint` for a bridge. A
+  `mint` step with `forwarded: true` was submitted by Circle's Forwarder.
+- `onBurnSubmitted(txHash)` fires with the burn hash before any receipt wait.
+  If you keep your own records, save it here.
+
+## Balance and max amount
+
+`engine.balance({ chain, address })` returns USDC subunits as a `bigint`.
+`engine.maxSendable(params)` takes the quote parameters without `amount` and
+returns:
+
+<ResponseField name="amount" type="string">
+  The largest decimal amount whose quote fits the balance, ready for `quote`.
+</ResponseField>
+
+<ResponseField name="balance" type="bigint">
+  The USDC balance in subunits.
+</ResponseField>
+
+<ResponseField name="gasReserve" type="bigint">
+  Subunits held back for gas. Non-zero only where gas is paid in USDC, as on
+  Arc.
+</ResponseField>
+
+Both read EVM chains only today and return `null` for a Solana, Stellar or
+Starknet source
+([usewhisk/whisk#157](https://github.com/usewhisk/whisk/issues/157)). The
+balance check before `send` is skipped in that case and the wallet has the
+final say.
+
+## In-flight transfers
+
+Every bridge is written to the engine's `inflightStore`: as `signing` before
+the wallet is asked, `burned` with the hash as soon as the wallet returns it,
+`attested`, and `minted` at the end. A transfer that fails before the burn
+leaves nothing behind. The default store is in memory and lasts as long as the
+engine. Pass `createStorageInflightStore(localStorage)` in a browser, or your
+own store on a server (see [server](/headless/server)).
+
+```ts resume.ts
+import { createStorageInflightStore, createWhisk } from "@usewhisk/core";
+
+const engine = createWhisk({
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+  inflightStore: createStorageInflightStore(window.localStorage),
+});
+
+for (const record of await engine.inflight()) {
+  if (record.step === "minted") {
+    await engine.dismiss(record.id);
+    continue;
+  }
+  if (record.step === "signing") continue;
+  const result = await engine.resume(
+    record,
+    {},
+    {
+      onStep: (step) => console.log(record.id, step.name, step.state),
+    },
+  );
+  if (result.kind === "success") await engine.dismiss(record.id);
+}
+
+const fromLink = await engine.resumeFromTx({
+  sourceChain: "Base_Sepolia",
+  txHash: "0x...",
+});
+console.log(fromLink.kind);
+```
+
+- `inflight()` lists the records, oldest first.
+- `resume(record, options, listeners)` waits for the attestation, re-attests an
+  expired one, and mints, unless Circle forwards the mint or the destination
+  already has it. It never signs the burn again. A record with no burn hash
+  (stuck at `signing`) returns a failure asking for the tx hash.
+- `resumeFromTx({ sourceChain, txHash })` does the same from a burn hash alone,
+  such as one from a receipt link.
+- `dismiss(id)` removes a record. Burned records are never dropped on their
+  own.
+
+Pass `destinationAdapter` in `options` when the route needs the destination
+wallet to sign the mint.
+
+## Other ecosystems
+
+The engine takes a `SolanaAdapter`, `StellarAdapter` or `StarknetAdapter` the
+same way. The shapes are in [wallet adapters](/hooks/wallet-adapters), and the
+React package's implementations are a good starting point for your own. A
+bridge Circle does not forward (into Solana, Stellar or Starknet, or out of
+Stellar or Starknet) needs `destinationAdapter` on `quote` and `send`.

@@ -1,0 +1,119 @@
+---
+title: ConnectModal
+description: The wallet picker from WhiskSend on its own, for connecting EVM, Solana, Stellar and Starknet wallets from your own button.
+---
+
+`ConnectModal` is the dialog `WhiskSend` opens from its "Connect wallet" button. Render it yourself to connect wallets from anywhere in your app, such as a header button. You control whether it is open.
+
+```tsx ConnectButton.tsx
+import { useState } from "react";
+import { Button, ConnectModal } from "@usewhisk/react";
+
+export function ConnectButton() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button onClick={() => setOpen(true)}>Connect wallet</Button>
+      <ConnectModal open={open} onOpenChange={setOpen} />
+    </>
+  );
+}
+```
+
+It must be inside a [`WhiskProvider`](/widget/whisk-provider). The dialog renders into the provider's portal element, so it keeps the widget's theme wherever you render the trigger.
+
+## Props
+
+<ParamField path="open" type="boolean" required>
+  Whether the dialog is open.
+</ParamField>
+
+<ParamField path="onOpenChange" type="(open: boolean) => void" required>
+  Called with `false` when the payer closes the dialog (close button, Escape,
+  overlay click) and after a wallet connects or disconnects.
+</ParamField>
+
+<ParamField path="title" type="string">
+  Replaces the heading. By default it follows the step: "Connect a wallet", then
+  "EVM wallet" (or "Solana wallet", and so on), or "Connected" while a wallet is
+  connected.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the heading on every step.
+</ParamField>
+
+## How it works
+
+<Steps>
+  <Step title="Pick an ecosystem">
+    The first screen lists EVM, Solana, Stellar and Starknet. An ecosystem whose
+    factory (`evm()`, `solana()`, `stellar()`, `starknet()`) is not in
+    `config.wallets` is shown disabled with a "Coming soon" tag.
+  </Step>
+  <Step title="Pick a wallet">
+    The second screen lists the wallets found for that ecosystem, with a back
+    button to the first screen.
+  </Step>
+  <Step title="Connect">
+    Picking a wallet asks it to connect. On success the dialog closes. On
+    failure the error shows under the list and the dialog stays open for another
+    try.
+  </Step>
+</Steps>
+
+Where each list comes from:
+
+| Ecosystem | Wallets listed                                                                                                                               | When none are found                                                    |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| EVM       | The connectors in your wagmi config (with `evm()`: injected browser wallets, Coinbase Wallet, and WalletConnect when you pass a `projectId`) | Asks the payer to install a browser wallet and reload.                 |
+| Solana    | Wallets that announce themselves through Wallet Standard. No per-wallet adapters are bundled.                                                | Suggests Phantom, Solflare or Backpack.                                |
+| Stellar   | Freighter, Albedo, xBull, Lobstr, Hana and the other wallets Whisk registers with Stellar Wallets Kit.                                       | "Loading Stellar wallets…", then suggests installing one.              |
+| Starknet  | Wallets found by get-starknet. A wallet that is not installed opens its install page.                                                        | "Loading Starknet wallets…", then asks to install Argent X or Braavos. |
+
+With an outer `WagmiProvider`, the EVM list shows the connectors from your own wagmi config.
+
+## While a wallet is connected
+
+If any wallet is connected, in any ecosystem, the dialog skips the pickers. It shows each connected account (short address and the chain or wallet name) and a **Disconnect** button. Disconnect disconnects every connected wallet, then closes the dialog. If one of them fails to disconnect, the error shows and the dialog stays open.
+
+<Note>
+  Because of this, the modal cannot add a second ecosystem while one is
+  connected. Most transfers need only the source wallet. A bridge that Circle
+  does not forward, such as one into Solana, Stellar or Starknet, also needs a
+  wallet on the destination; see [cross-ecosystem
+  bridges](/widget/whisk-send#cross-ecosystem-bridges).
+</Note>
+
+## Reflecting the connection
+
+The modal does not report which wallet connected. Read it from the adapter hooks, which return `null` until a wallet is connected:
+
+```tsx WalletStatus.tsx
+import { useState } from "react";
+import { useAccount } from "wagmi";
+import { Button, ConnectModal, useSolanaAdapter } from "@usewhisk/react";
+
+export function WalletStatus() {
+  const [open, setOpen] = useState(false);
+  const evm = useAccount();
+  const solana = useSolanaAdapter();
+  const connected = evm.isConnected || solana !== null;
+
+  return (
+    <>
+      <Button variant="outline" onClick={() => setOpen(true)}>
+        {connected ? "Manage wallets" : "Connect wallet"}
+      </Button>
+      <ConnectModal
+        open={open}
+        onOpenChange={setOpen}
+        title={connected ? "Your wallets" : "Pay with USDC"}
+        description="EVM chains, Solana, Stellar and Starknet are supported."
+      />
+    </>
+  );
+}
+```
+
+`useEvmAdapter`, `useSolanaAdapter`, `useStellarAdapter` and `useStarknetAdapter` each give the connected wallet as a Whisk adapter. See [wallet adapters](/hooks/wallet-adapters) and [wallets](/wallets).

@@ -1,0 +1,153 @@
+---
+title: Fund safety
+description: What Whisk guarantees about the payer's USDC, how each guarantee is enforced, and where 0.3 falls short.
+---
+
+A bridge burns USDC on one chain and mints it on another. Between the two, the money exists only as a message Circle has attested. Whisk's rules are built around that gap: nothing that could stop the mint is left until after the burn, every burn is recorded the moment it is signed, and the payer signs exactly the quote they confirmed. This page lists each guarantee, how the code enforces it, and the cases it does not cover.
+
+```ts
+import { createWhisk, type EvmAdapter } from "@usewhisk/core";
+
+declare const adapter: EvmAdapter;
+declare function persist(txHash: string): Promise<void>;
+
+const engine = createWhisk({ chains: ["Base", "Arc"] });
+
+const recipient = await engine.resolve(
+  "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  "Arc",
+);
+const quote = await engine.quote({
+  sourceChain: "Base",
+  destinationChain: "Arc",
+  recipient,
+  amount: "250",
+  adapter,
+});
+
+const result = await engine.send(
+  { quote, adapter },
+  { onBurnSubmitted: (txHash) => void persist(txHash) },
+);
+```
+
+## Checks before the burn
+
+These run before the payer is asked to sign the burn. When one fails, the burn is never submitted.
+
+**When quoting** (`engine.quote` throws):
+
+- the recipient is a valid address for the destination ecosystem: an EVM address (with its checksum checked when it is mixed case), a Solana public key, a Stellar `G`, `M` or `C` strkey, or a Starknet felt (`InvalidAddressError`);
+- a Starknet recipient is not Ethereum-shaped (below `2**160`) or past Starknet's address range (`InvalidAddressError`), and has an account deployed, unless it is the connected Starknet wallet or the quote passes `allowUndeployedRecipient: true` (`RouteUnavailableError`, `recipient_not_deployed`);
+- source and destination are on the same network (`NetworkMismatchError`) and are not the same chain;
+- a wallet is connected for the source and, when Circle does not forward the mint, for the destination (`RouteUnavailableError`);
+- with `feeBearer: "receiver"`, the fees do not exceed the amount (`ConfigError`).
+
+**When sending, before any signature** (`engine.send` throws):
+
+- the quote has not expired (`QuoteExpiredError`);
+- on EVM sources, the payer's USDC covers `amountIn`, plus the gas reserve on Arc (`InsufficientBalanceError`);
+- the route still plans the same speed and the same minter (`QuoteChangedError`);
+- Circle's current fees still fit under the quote's `maxFee`, or Circle's signed upfront fee is at or below the shown fee and has not expired (`QuoteChangedError`, `QuoteExpiredError`);
+- the adapters match the chains' ecosystems, and a destination wallet is present where the route needs one (`ConfigError`);
+- on EVM sources, the merchant fee recipient is a valid EVM address (`ConfigError`).
+
+**In the route's executor, before the burn** (`send` returns a failure):
+
+- the burn call builds, which encodes and validates the recipient for the CCTP message;
+- the source wallet is on the source chain. An EVM wallet is asked to switch; a Solana wallet must be on the right cluster, a Stellar wallet on the right network, and a Starknet wallet on the right chain id, or the transfer stops;
+- into Solana: the destination wallet is on the destination cluster, and the recipient's USDC account exists (`RouteUnavailableError`, `recipient_account_missing`), because a CCTP mint cannot create it;
+- into Stellar: the destination wallet is on the destination network, and a `G` or `M` recipient holds an authorized USDC trustline with room for the amount (`RouteUnavailableError`, `recipient_account_missing`). A destination adapter without `getTrustline` cannot run that check, so a bridge to a `G` or `M` recipient is refused with `ConfigError`;
+- into Stellar: the burn names Circle's `CctpForwarder` as both `mintRecipient` and `destinationCaller`, with the real recipient in the hook data. A burn to a Stellar wallet directly could never be minted, so Whisk never builds one;
+- into Starknet: the destination wallet is on the destination chain id (`WrongChainError`).
+
+A check that cannot run, such as a trustline or class hash read that fails over RPC, refuses the transfer rather than skipping the check.
+
+All 12 bridge routes are covered by tests that run the real engine against a fake chain and a fake Iris, and assert the burn arguments: domain, recipient, destination caller, `maxFee` and hook data.
+
+## The merchant fee never goes first
+
+A `feePolicy` fee is never sent before the burn or the same-chain transfer. When the EVM adapter's `supportsAtomicBatch` says yes for the source chain, the approve, the burn and the fee shares go in one `sendCalls` with `atomic: true`, and land together or not at all. Otherwise the burn or transfer goes alone, and the fee is asked for once its receipt is a success, before the attestation wait. A payer who rejects the burn, or whose burn reverts, pays no fee. `SendSuccess.customFee` and `SendFailure.customFee` say whether it was paid. See [merchant fees](/concepts/quotes-and-fees#merchant-fees-feepolicy).
+
+## Network from the source chain
+
+There is no `mode` option. Each transfer takes its network (mainnet or testnet) from its source chain id:
+
+- `planRoute` refuses a source and destination on different networks;
+- Iris requests go to `iris-api.circle.com` for a mainnet source and `iris-api-sandbox.circle.com` for a testnet source;
+- an in-flight record stores the network, and `resumeFromTx` takes it from the source chain.
+
+A mainnet burn is never polled against the testnet Iris, or the other way round. A config may list mainnet and testnet chains together; `<WhiskSend>` only offers destinations on the source chain's network.
+
+## Bound quotes
+
+The burn uses the quote's `subunits.burnAmount` and `subunits.maxFee` exactly. Nothing between the screen and the signature recomputes them. If the route or Circle's fees moved, `send` refuses and hands back a fresh quote for the payer to confirm. See [bound quotes](/concepts/quotes-and-fees#bound-quotes).
+
+On a Fast route the cap includes a 10% buffer over Circle's protocol fee. If fees still rise past it between the burn and the attestation, Circle attests the transfer as Standard. That makes it slower (up to 19 minutes from Ethereum and the OP-stack chains) but loses no USDC.
+
+## A recovery path for every burn
+
+- `send` writes an in-flight record before the wallet is asked, and adds the burn hash the moment the wallet returns it, before waiting for a receipt. `onBurnSubmitted` gives you the same hash.
+- A record with a burn hash is never removed by Whisk; only `engine.dismiss` removes it.
+- `resume` checks the attested message against the record (destination domain and amount) before minting, checks whether the destination already received the message so it never mints twice, and asks Circle to re-attest an attestation that expired.
+- If Circle's forwarder fails, the mint falls back to a wallet on the destination. Burns into EVM chains leave `destinationCaller` empty, so any wallet can submit the mint and the USDC still goes to the recipient in the message.
+- `resumeFromTx` rebuilds a record from the burn hash alone, from what Iris decoded.
+
+See [recovery](/concepts/recovery).
+
+## Wrong-chain checks
+
+- An EVM adapter's chain is read from the wallet before the calls are submitted, and the wallet is asked to switch when it is wrong. A declined or failed switch ends the transfer before anything is signed.
+- Solana, Stellar and Starknet source wallets on the wrong cluster, network or chain id stop the transfer before the burn.
+- Every transaction on Arc carries a `maxFeePerGas` at or above Arc's 20 gwei floor, because Arc drops transactions offering less.
+
+## The mainnet release gate
+
+Before `@usewhisk/core@0.2.0` and `@usewhisk/react@0.2.0` were published, the release was held until:
+
+- the testnet matrix passed: Arc Testnet to Base Sepolia, Base Sepolia to Arc Testnet, Ethereum Sepolia to Solana Devnet, Solana Devnet to Arc Testnet, Arc Testnet to Stellar Testnet, and Arc Testnet to Starknet Sepolia, plus a burn-then-resume run;
+- two mainnet transfers of 1 USDC settled with the expected amounts: Base to Arc and Arc to Base.
+
+Other mainnet routes are covered by the route tests and the testnet matrix, not by a mainnet transfer. A nightly job also reads every EVM entry in the chain registry back from its chain and fails on any disagreement, including whether the fee-switch flag matches a working `getMinFeeAmount`.
+
+## Known gaps
+
+These are real in 0.3. Plan around them.
+
+<AccordionGroup>
+  <Accordion title="A payer can decline the merchant fee">
+    On a wallet without atomic EIP-5792 batches, and on Arc, where calls carry their own gas price and are sent one by one, the fee is a separate request after the burn or transfer has landed. A payer who rejects it, or whose fee transfer reverts, still gets the transfer, and the result reports `customFee.status: "unpaid"` with the error. Check `customFee` before you fulfil an order.
+  </Accordion>
+  <Accordion title="Merchant fees are not collected on non-EVM sources">
+    From Solana, Stellar and Starknet, the quote lists the merchant fee and includes it in `amountIn`, but no fee transfer is sent and the result has no `customFee`. The payer pays less than the quote said and the merchant receives nothing.
+  </Accordion>
+  <Accordion title="EVM destination wallets are checked at mint time">
+    Into Solana, Stellar and Starknet, the destination wallet's cluster, network or chain id is checked before the burn. Into EVM, a destination wallet that signs the mint is checked and switched only when it is asked to mint, after the burn. A wallet that cannot switch then fails the mint; switch it and resume. The USDC is not lost.
+  </Accordion>
+  <Accordion title="An undeployed Starknet recipient can be confirmed">
+    With `allowUndeployedRecipient: true`, Whisk mints to a Starknet address with no account. That is right for the payer's own new wallet and wrong for a typo: USDC sent there waits for whoever deploys an account at that address. Set it only after the payer confirms, as `<WhiskSend>` does.
+  </Accordion>
+  <Accordion title="Balances are checked on EVM sources only">
+    Whisk does not read USDC balances on Solana, Stellar or Starknet. An underfunded payer there gets a failed transaction from the wallet or the chain instead of an `InsufficientBalanceError`. No USDC is burned.
+  </Accordion>
+  <Accordion title="The default store forgets on reload">
+    `createWhisk` keeps in-flight records in memory unless you pass `inflightStore`. `<WhiskProvider>` uses `localStorage`, but falls back to memory where the page cannot write to it, such as Safari private browsing. A transfer burned in such a session can still be finished with `resumeFromTx`, if the payer has the burn hash.
+  </Accordion>
+  <Accordion title="A low forwarding fee delays the mint">
+    Circle spends the forwarding fee as destination gas. If gas rises past it, the forwarded mint is delayed or fails. The USDC is not lost: resume mints it with a destination wallet.
+  </Accordion>
+  <Accordion title="The source chain is checked once per send">
+    On EVM, Whisk reads the wallet's chain once before submitting the approval and the burn, not before each call. A wallet that changes chain between the two calls is not caught by Whisk.
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Recovery" href="/concepts/recovery">
+    Finishing a transfer after the burn.
+  </Card>
+  <Card title="Errors" href="/concepts/errors">
+    Which failures happen before the burn and which after.
+  </Card>
+</CardGroup>

@@ -1,0 +1,211 @@
+---
+title: useReceipt
+description: Poll Circle for one transfer and get back its stage, steps and explorer links.
+---
+
+`useReceipt` follows a transfer from its source-chain tx hash. It is the hook
+behind [`<WhiskReceipt>`](/widget/whisk-receipt), for when you want the status
+in your own markup.
+
+```tsx TransferStatus.tsx
+import {
+  RECEIPT_STAGE_HELP,
+  RECEIPT_STAGE_LABELS,
+  useReceipt,
+} from "@usewhisk/react";
+
+export function TransferStatus({ txHash }: { txHash: string }) {
+  const { view, isLoading, error } = useReceipt({
+    sourceChain: "Base_Sepolia",
+    sourceTxHash: txHash,
+    destinationChain: "Arc_Testnet",
+  });
+
+  if (error) return <p role="alert">Could not reach Circle: {error.message}</p>;
+  if (isLoading || !view) return <p>Looking up the transfer...</p>;
+  return (
+    <div>
+      <strong>{RECEIPT_STAGE_LABELS[view.stage]}</strong>
+      <p>{RECEIPT_STAGE_HELP[view.stage]}</p>
+      <a href={view.sourceExplorerUrl}>Source transaction</a>
+    </div>
+  );
+}
+```
+
+It runs on react-query, so it needs a `QueryClient` in scope.
+[`<WhiskProvider>`](/widget/whisk-provider) provides one, or reuses yours. It
+does not need a connected wallet.
+
+## How it polls
+
+- A **same-chain** send never polls. The source transaction is the settlement,
+  so the view is `settled` at once (or `failed` with `hasError`).
+- A **cross-chain** transfer asks Circle's Iris API about the burn every
+  `pollIntervalMs` (3 seconds by default). It stops when Iris reports
+  `complete`, when `pollTimeoutMs` passes (10 minutes by default), or when you
+  pass `destinationTxHash` or `hasError`.
+- The timeout clock starts when the hook first sees a source chain and hash,
+  and restarts only when one of them changes, not on every render.
+- Iris is picked from the source chain: the production API for a mainnet
+  chain, the sandbox for a testnet one.
+
+<Warning>
+  Iris knows about the attestation, not the mint. When it reports `complete` the
+  stage moves to `attested` ("Minting on destination") and polling stops. The
+  hook does not watch the destination chain, so it reaches `settled` only when
+  you pass `destinationTxHash`. Take it from `SendSuccess.finalTxHash`. On a
+  forwarded mint that hash can be missing; a successful `SendResult` already
+  means the USDC was minted.
+</Warning>
+
+## Stages
+
+`view.stage` is a `ReceiptStage`. `RECEIPT_STAGE_LABELS` and
+`RECEIPT_STAGE_HELP` hold the English text `<WhiskReceipt>` shows; both are
+plain records you can replace to translate.
+
+| Stage                  | When                                                          | `RECEIPT_STAGE_LABELS`     | `RECEIPT_STAGE_HELP`                                                  |
+| ---------------------- | ------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------- |
+| `submitted`            | Burn sent; Iris has not seen it yet (or answered `not_found`) | Submitted                  | We're waiting for the burn to be picked up.                           |
+| `awaiting_attestation` | Iris is waiting on source-chain confirmations                 | Confirming on source chain | Circle is signing the cross-chain message. This usually takes 30–90s. |
+| `attested`             | Attestation ready, no destination tx known                    | Minting on destination     | Attestation ready. The destination mint will land shortly.            |
+| `settled`              | `destinationTxHash` given, or a same-chain send               | Settled                    | Funds have landed on the destination chain.                           |
+| `failed`               | You passed `hasError`                                         | Failed                     | Something went wrong. Check the source tx for the full revert.        |
+
+`view.steps` is a single `transfer` step for a same-chain send, and `burn`,
+`fetchAttestation`, `mint` for a bridge, each with a `state` of `pending`,
+`success`, `error` or `noop`.
+
+## Follow a send you just made
+
+Start the receipt from `onBurnSubmitted`, which fires as soon as the wallet
+returns the burn hash, then hand it the mint hash when `send` resolves.
+
+```tsx PayAndTrack.tsx
+import { useState } from "react";
+import {
+  RECEIPT_STAGE_LABELS,
+  toWhiskError,
+  useReceipt,
+  useWhisk,
+  type Quote,
+} from "@usewhisk/react";
+
+export function PayAndTrack({ quote }: { quote: Quote }) {
+  const { send } = useWhisk();
+  const [burnTx, setBurnTx] = useState<string>();
+  const [mintTx, setMintTx] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  const [message, setMessage] = useState<string>();
+
+  const { view } = useReceipt({
+    sourceChain: "Base_Sepolia",
+    sourceTxHash: burnTx,
+    destinationChain: "Arc_Testnet",
+    destinationTxHash: mintTx,
+    hasError: failed,
+  });
+
+  async function pay() {
+    try {
+      const result = await send({ quote }, { onBurnSubmitted: setBurnTx });
+      if (result.kind === "success") setMintTx(result.finalTxHash);
+      else setFailed(true);
+    } catch (err) {
+      setMessage(toWhiskError(err).message);
+    }
+  }
+
+  return (
+    <div>
+      <button onClick={pay}>Pay {quote.amountIn} USDC</button>
+      {message ? <p role="alert">{message}</p> : null}
+      {view ? <p>{RECEIPT_STAGE_LABELS[view.stage]}</p> : null}
+    </div>
+  );
+}
+```
+
+If the burn landed but the mint did not, the transfer can be finished from the
+hash alone with `engine.resumeFromTx`. `<WhiskReceipt>` shows a button for
+that; see [recovery](/concepts/recovery).
+
+## Input
+
+<ParamField path="sourceChain" type="Chain" required>
+  The chain the transfer was sent from. Its network picks the Iris endpoint.
+</ParamField>
+
+<ParamField path="sourceTxHash" type="string | undefined" required>
+  The burn (or same-chain transfer) hash. While it is `undefined` the hook does
+  nothing and `view` is `null`.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain" required>
+  Equal to `sourceChain` for a same-chain send.
+</ParamField>
+
+<ParamField path="destinationTxHash" type="string">
+  The mint hash, when you have it. Marks the transfer `settled` and stops
+  polling.
+</ParamField>
+
+<ParamField path="hasError" type="boolean">
+  Forces the `failed` stage and stops polling, for a caller that already has a
+  `SendFailure`.
+</ParamField>
+
+<ParamField path="pollIntervalMs" type="number">
+  Milliseconds between Iris requests. Default `3000`.
+</ParamField>
+
+<ParamField path="pollTimeoutMs" type="number">
+  Stop polling after this many milliseconds. Default `600000` (10 minutes).
+</ParamField>
+
+## Result
+
+<ResponseField name="view" type="ReceiptView | null">
+  `stage`, `steps`, `isCrossChain`, `sourceExplorerUrl` and, once
+  `destinationTxHash` is known, `destinationExplorerUrl`. `null` without a
+  `sourceTxHash`.
+</ResponseField>
+
+<ResponseField name="irisStatus" type="IrisStatus | undefined">
+  The latest Iris status: `pending_confirmations`, `complete` or `not_found`.
+</ResponseField>
+
+<ResponseField name="message" type="IrisMessage | null">
+  The latest Iris response, with `message` and `attestation` once signed.
+</ResponseField>
+
+<ResponseField name="isLoading" type="boolean">
+  `true` while waiting for the first Iris response of a cross-chain transfer.
+</ResponseField>
+
+<ResponseField name="error" type="Error | null">
+  Set when an Iris request fails, such as on a network error.
+</ResponseField>
+
+## Without React
+
+`deriveReceiptView` is the pure function the hook feeds each Iris answer
+through. Use it on a server or in another framework, with `pollAttestation` or
+`fetchAttestationOnce` for the polling.
+
+```ts
+import { deriveReceiptView, RECEIPT_STAGE_LABELS } from "@usewhisk/react";
+
+const view = deriveReceiptView({
+  sourceChain: "Base_Sepolia",
+  sourceTxHash: "0x...",
+  destinationChain: "Arc_Testnet",
+  irisStatus: "complete",
+});
+
+console.log(RECEIPT_STAGE_LABELS[view.stage]);
+```
+
+`describeReceiptChains(view, input)` adds the chains' display labels. See
+[receipts](/flows/receipts) for receipt links and a server-side worker.

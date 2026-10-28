@@ -1,0 +1,121 @@
+---
+title: Tailwind
+description: Map the --whisk-* variables to Tailwind classes such as bg-whisk-primary, so your own markup follows the widget's theme.
+---
+
+`@usewhisk/react/tailwind` exports `whiskTheme`, a Tailwind preset that maps the widget's CSS variables to color, radius and font utilities. Use it when you build parts of a payment UI yourself and want them to follow the active Whisk theme.
+
+```ts tailwind.config.ts
+import { whiskTheme } from "@usewhisk/react/tailwind";
+
+export default {
+  content: ["./src/**/*.{ts,tsx}"],
+  presets: [whiskTheme()],
+};
+```
+
+The preset only adds class names. The values still come from `@usewhisk/react/styles.css` and the `theme` prop, so keep importing the stylesheet.
+
+## Classes it adds
+
+Every value is a `var(--whisk-…)` reference, added under `theme.extend`, so your own colors, radii and fonts are untouched.
+
+| Kind        | Classes (with `bg-`, `text-`, `border-`, `ring-` and other color utilities) | Variable                                                   |
+| ----------- | --------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Colors      | `whisk-bg`, `whisk-fg`, `whisk-fg-muted`                                    | `--whisk-bg`, `--whisk-fg`, `--whisk-fg-muted`             |
+|             | `whisk-card`, `whisk-card-fg`                                               | `--whisk-card`, `--whisk-card-fg`                          |
+|             | `whisk-border`, `whisk-input`, `whisk-ring`                                 | `--whisk-border`, `--whisk-input`, `--whisk-ring`          |
+|             | `whisk-primary`, `whisk-primary-fg`                                         | `--whisk-primary`, `--whisk-primary-fg`                    |
+|             | `whisk-success`, `whisk-warning`                                            | `--whisk-success`, `--whisk-warning`                       |
+|             | `whisk-destructive`, `whisk-destructive-fg`                                 | `--whisk-destructive`, `--whisk-destructive-fg`            |
+| Radius      | `rounded-whisk`, `rounded-whisk-sm`, `rounded-whisk-lg`                     | `--whisk-radius`, `--whisk-radius-sm`, `--whisk-radius-lg` |
+| Font family | `font-whisk`, `font-whisk-mono`                                             | `--whisk-font`, `--whisk-font-mono`                        |
+
+There is no class for `--whisk-radius-md`, `--whisk-border-w` or `--whisk-font-display`. Use an arbitrary value such as `rounded-[var(--whisk-radius-md)]`.
+
+```tsx Summary.tsx
+import { Card } from "@usewhisk/react";
+
+export function Summary({ total }: { total: string }) {
+  return (
+    <Card className="flex flex-col gap-2">
+      <p className="font-whisk text-sm text-whisk-fg-muted">Total</p>
+      <p className="font-whisk-mono text-2xl text-whisk-fg">{total} USDC</p>
+      <span className="rounded-whisk-sm bg-whisk-primary px-2 py-1 text-whisk-primary-fg">
+        Due today
+      </span>
+    </Card>
+  );
+}
+```
+
+<Warning>
+  The variables are defined on the `[data-whisk]` element the provider renders,
+  not on `:root`. These classes only resolve inside a `WhiskProvider`. Outside
+  it, `bg-whisk-primary` points at an undefined variable and renders nothing.
+</Warning>
+
+## A custom prefix
+
+`whiskTheme({ prefix })` renames every class. The default prefix is `"whisk"`.
+
+```ts tailwind.config.ts
+import { whiskTheme } from "@usewhisk/react/tailwind";
+
+export default {
+  content: ["./src/**/*.{ts,tsx}"],
+  presets: [whiskTheme({ prefix: "pay" })],
+};
+```
+
+This gives `bg-pay-primary`, `rounded-pay-lg`, `font-pay-mono` and so on. The CSS variables keep their `--whisk-` names.
+
+The preset is also the module's default export, so `import whiskTheme from "@usewhisk/react/tailwind"` works too. If you type your config, add `satisfies Config` with `Config` from `tailwindcss`.
+
+## Opacity
+
+The variables hold plain colors such as hex values, not separate channels, so Tailwind v3's opacity modifiers (`bg-whisk-primary/20`) do not apply to them. Mix the color instead:
+
+```html
+<div class="bg-[color-mix(in_srgb,var(--whisk-primary)_20%,transparent)]"></div>
+```
+
+## Tailwind v4
+
+`whiskTheme` returns a JavaScript preset in the v3 config format. Tailwind v4 reads a JavaScript config through the `@config` directive, so the same file works:
+
+```css app.css
+@import "tailwindcss";
+@config "../tailwind.config.ts";
+```
+
+The path is relative to the CSS file. If you would rather stay CSS-only in v4, declare the same mappings with `@theme inline`, which keeps the `var()` references so the classes follow the widget's theme:
+
+```css app.css
+@import "tailwindcss";
+
+@theme inline {
+  --color-whisk-bg: var(--whisk-bg);
+  --color-whisk-fg: var(--whisk-fg);
+  --color-whisk-fg-muted: var(--whisk-fg-muted);
+  --color-whisk-card: var(--whisk-card);
+  --color-whisk-border: var(--whisk-border);
+  --color-whisk-primary: var(--whisk-primary);
+  --color-whisk-primary-fg: var(--whisk-primary-fg);
+  --color-whisk-success: var(--whisk-success);
+  --color-whisk-warning: var(--whisk-warning);
+  --color-whisk-destructive: var(--whisk-destructive);
+  --radius-whisk: var(--whisk-radius);
+  --radius-whisk-lg: var(--whisk-radius-lg);
+  --font-whisk: var(--whisk-font);
+  --font-whisk-mono: var(--whisk-font-mono);
+}
+```
+
+Add the remaining variables from the table above the same way if you use them.
+
+## Dark mode
+
+With `theme="dark"` the widget root has the `dark` class as well as `data-whisk-theme="dark"`. If your Tailwind dark mode is class-based, `dark:` variants inside the widget follow it. With `theme="auto"` there is no class; the media-query strategy (Tailwind's default) matches the widget, since both follow `prefers-color-scheme`.
+
+You rarely need `dark:` for Whisk colors, since the variables already switch with the theme.

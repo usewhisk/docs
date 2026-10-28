@@ -1,0 +1,315 @@
+---
+title: "Migrate from 0.2 to 0.3"
+sidebarTitle: "0.2 to 0.3"
+description: "Upgrade @usewhisk/core and @usewhisk/react from 0.2 to 0.3, which never take the merchant fee before the burn and check Stellar and Starknet recipients before anything is signed."
+---
+
+This page is for apps on `@usewhisk/core` or `@usewhisk/react` 0.2.x. Start by upgrading both packages:
+
+```bash
+npm install @usewhisk/react@^0.3.0 @usewhisk/core@^0.3.0
+```
+
+0.3 is a fund-safety release. It gathers three fixes:
+
+- **0.2.1:** bridges into Stellar and Starknet check the destination before the burn, including the Stellar recipient's USDC trustline.
+- **0.2.2** (with `@usewhisk/cctp` 0.1.1): a quote into Starknet refuses an Ethereum-shaped address and, unless the payer confirms, an address with no account deployed.
+- **0.3.0:** a `feePolicy` fee is never sent before the burn or the same-chain transfer, and results say whether it was paid.
+
+`@usewhisk/react` 0.2.x depends on `@usewhisk/core` `^0.2.0`, so an app that reinstalled since 0.2.0 may already run the 0.2.1 and 0.2.2 checks. Everything below applies either way.
+
+Most apps only need the install above. Read on if you set a `feePolicy`, write your own wallet adapters, switch over `RouteUnavailableReason`, or bridge into Starknet. The [upgrade checklist](#upgrade-checklist) at the end lists the work in order.
+
+## Install
+
+### Dependency changes
+
+| Package           | 0.2                                                                 | 0.3                                                              |
+| ----------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `@usewhisk/react` | depends on `@usewhisk/core` `^0.2.0` and `@wagmi/core` `^2.16.3`    | depends on `@usewhisk/core` `^0.3.0` and `@wagmi/core` `^2.17.0` |
+| `@usewhisk/core`  | depends on `@usewhisk/cctp` `^0.1.0`                                | depends on `@usewhisk/cctp` `^0.1.1`                             |
+| Peers             | `react`, `react-dom`, `@tanstack/react-query`, `viem` `>=2.57.5 <3` | unchanged                                                        |
+
+`@wagmi/core` 2.17 is the first version with the EIP-5792 actions the React EVM adapter now uses: `getCapabilities`, `sendCalls` and `waitForCallsStatus`. It is a regular dependency of `@usewhisk/react`, so a normal install picks it up. If your lockfile, `overrides` or `resolutions` hold `@wagmi/core` below 2.17, raise them.
+
+## Changes
+
+### 1. The merchant fee comes with the burn or after it
+
+In 0.2 a `feePolicy` fee went out as USDC transfers ahead of the approve and the burn. A payer who then rejected the burn, or whose burn reverted, had paid the fee for nothing.
+
+In 0.3, on an EVM source:
+
+- When the adapter's `supportsAtomicBatch` says yes for the source chain, the approve, the burn and the fee shares go in one `sendCalls` with `atomic: true`. The wallet lands all of them or none.
+- Otherwise the burn or transfer goes alone. Once it lands, the engine asks for each fee share as its own request, before waiting for the attestation. A payer who rejects that request, or whose fee transfer reverts, still gets the transfer.
+
+`useEvmAdapter` answers `supportsAtomicBatch` from wagmi's `getCapabilities`. On Arc every call carries its own gas price, which a batch cannot carry, so on Arc the fee is always a separate request after the burn.
+
+<Warning>
+  A payer on a wallet without atomic batches can now decline the fee and keep
+  the transfer. If you fulfil orders from `onSuccess`, check `customFee` first.
+</Warning>
+
+Nothing changes on Solana, Stellar and Starknet sources: the quote still lists the fee, and no fee transfer is sent.
+
+See [when the fee is paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+### 2. Results carry `customFee`
+
+`SendSuccess` and `SendFailure` gain `customFee?: CustomFeeOutcome`. It is set whenever a fee policy charged the transfer, which means on EVM sources with a `feePolicy` whose `value` is above zero.
+
+```ts
+type CustomFeeOutcome =
+  | { status: "paid"; txHashes: `0x${string}`[]; amount: string }
+  | {
+      status: "unpaid";
+      amount: string;
+      error?: WhiskError;
+      txHashes?: `0x${string}`[];
+    };
+```
+
+- `paid`: every share landed. `txHashes` are the fee's transactions, or the one hash of an atomic batch that shares it.
+- `unpaid` with `error`: the burn or transfer landed, then the payer rejected the fee or it reverted. `txHashes` lists a share that landed before the payer stopped, if any.
+- `unpaid` with no `error`: the fee was never asked for, because the burn or transfer did not land.
+
+`amount` is the whole fee as a decimal USDC string. `CustomFeeOutcome` is exported from `@usewhisk/core`; from `@usewhisk/react`, use `NonNullable<SendSuccess["customFee"]>`.
+
+<CodeGroup>
+
+```tsx 0.2
+<WhiskSend onSuccess={(result) => fulfil(result.finalTxHash)} />
+```
+
+```tsx 0.3
+<WhiskSend
+  onSuccess={(result) => {
+    if (result.customFee?.status === "unpaid") {
+      holdOrder(result.customFee.amount, result.finalTxHash);
+      return;
+    }
+    fulfil(result.finalTxHash);
+  }}
+/>
+```
+
+</CodeGroup>
+
+`<WhiskSend>` itself now adds "The 0.25 USDC fee was not paid" to its success banner, with the reason, when `customFee` is `unpaid`.
+
+In-flight records gain `customFee: { amount, status, txHashes? }`, with `amount` in subunits. A transfer resumed with `resume` or `resumeFromTx` reports the fee from its record and never asks the payer for it again. Records written by 0.2 have no `customFee` and still load. If you store records yourself, keep the new field.
+
+### 3. Custom EVM adapters: `supportsAtomicBatch` and `atomic`
+
+This applies if you built an `EvmAdapter` yourself.
+
+`EvmAdapter` gains an optional `supportsAtomicBatch(chainId)`, and `SendCallsOptions` an optional `atomic`. Both are optional, so a 0.2 adapter still compiles and works: without `supportsAtomicBatch`, the engine never sets `atomic`, and sends the fee as separate `sendCalls([call])` requests once the burn has landed.
+
+Implement them only when your wallet can land a batch all or nothing. With `atomic: true`, `sendCalls` must land every call or none, or throw `WalletCapabilityError("atomic_unsupported", ...)` before sending anything. On that error the engine sends the calls one by one instead.
+
+```ts atomicAdapter.ts
+import {
+  WalletCapabilityError,
+  toWhiskError,
+  type EvmAdapter,
+  type EvmCall,
+} from "@usewhisk/core";
+
+declare const sequential: EvmAdapter;
+declare function walletBatchesAtomically(chainId: number): Promise<boolean>;
+declare function sendAtomicBatch(calls: EvmCall[]): Promise<`0x${string}`>;
+
+export const adapter: EvmAdapter = {
+  ...sequential,
+  supportsAtomicBatch: walletBatchesAtomically,
+  async sendCalls(calls, options) {
+    if (!options?.atomic) return sequential.sendCalls(calls, options);
+    // A batch has no per-call gas price, and on Arc every call sets one.
+    if (calls.some((c) => c.maxFeePerGas !== undefined)) {
+      throw new WalletCapabilityError(
+        "atomic_unsupported",
+        "These calls need their own gas price.",
+      );
+    }
+    let hash: `0x${string}`;
+    try {
+      hash = await sendAtomicBatch(calls);
+    } catch (cause) {
+      throw toWhiskError(cause, "Failed to submit the batch.");
+    }
+    options.onSubmitted?.(hash, calls.length - 1);
+    return { hashes: [hash] };
+  },
+};
+```
+
+`sendAtomicBatch` stands for your wallet's EIP-5792 call: submit the batch, wait for it to land, and resolve to a transaction hash from it. A batch that does not land must throw.
+
+See [EvmAdapter](/reference/core/engine#evmadapter).
+
+### 4. Custom Stellar adapters need `getTrustline` for classic accounts
+
+This applies if you built a `StellarAdapter` yourself and use it as the destination wallet of a bridge into Stellar.
+
+Before a burn into Stellar, the engine reads the recipient's USDC trustline through the destination adapter's new optional `getTrustline(account, asset)`. It refuses a `G` account, or the `G` account behind an `M` address, whose trustline is missing, not authorized or without room for the amount, with `RouteUnavailableError` reason `recipient_account_missing`.
+
+A custom adapter without `getTrustline` still compiles. Bridges into `C` contract addresses work as before, but a bridge into a `G` or `M` address is refused before the burn with a `ConfigError`. Add the method:
+
+```ts stellarTrustline.ts
+import { Asset, Keypair, rpc, xdr } from "@stellar/stellar-sdk";
+import { toWhiskError, type StellarAdapter } from "@usewhisk/core";
+
+declare const base: StellarAdapter;
+
+const server = new rpc.Server("https://soroban-testnet.stellar.org");
+
+export const adapter: StellarAdapter = {
+  ...base,
+  async getTrustline(account, asset) {
+    try {
+      const key = xdr.LedgerKey.trustline(
+        new xdr.LedgerKeyTrustLine({
+          accountId: Keypair.fromPublicKey(account).xdrAccountId(),
+          asset: new Asset(asset.code, asset.issuer).toTrustLineXDRObject(),
+        }),
+      );
+      const { entries } = await server.getLedgerEntries(key);
+      const entry = entries[0];
+      if (!entry) return null;
+      const line = entry.val.trustLine();
+      return {
+        balance: BigInt(line.balance().toString()),
+        limit: BigInt(line.limit().toString()),
+        authorized:
+          (line.flags() & xdr.TrustLineFlags.authorizedFlag().value) !== 0,
+      };
+    } catch (cause) {
+      throw toWhiskError(cause, "Failed to read the Stellar USDC trustline.");
+    }
+  },
+};
+```
+
+Return `null` only when the account has no trustline, and throw on an RPC failure: the engine refuses the send either way, but a thrown error tells the payer the real cause. `balance` and `limit` are in stroops (7 decimals). The adapter from `useStellarAdapter` already implements it.
+
+See [StellarAdapter](/reference/core/engine#stellaradapter) and [recipients](/concepts/recipients#stellar-trustlines-and-the-forwarder).
+
+### 5. Stellar and Starknet destinations are checked before the burn
+
+In 0.2.0 a destination Stellar or Starknet wallet on the wrong network failed only at the mint, after the burn, and a Stellar recipient without a trustline failed the same way. Since 0.2.1, on every route into Stellar or Starknet, `send` checks these before it asks the source wallet for anything, and returns a failure with nothing signed:
+
+| Check                                                              | Failure                                                        |
+| ------------------------------------------------------------------ | -------------------------------------------------------------- |
+| The destination wallet is on the destination's network or chain id | `WrongChainError`                                              |
+| A Stellar `G` or `M` recipient has a usable USDC trustline         | `RouteUnavailableError`, `reason: "recipient_account_missing"` |
+| The destination `StellarAdapter` can read trustlines               | `ConfigError`                                                  |
+
+A transfer that used to burn and then wait in the resume list now fails before the burn. Show these failures as something the payer can fix, not as a transfer to resume.
+
+### 6. Starknet recipients are checked at quote time
+
+Up to 0.2.1 a Starknet recipient was checked only for its shape, so a pasted Ethereum address got a quote and the USDC was minted to an address nobody controls. Since 0.2.2, a quote into Starknet, for a bridge or a same-chain send:
+
+- throws `InvalidAddressError` for an address below `2**160` (one that fits in 20 bytes, even zero-padded) or at or past `2**251 - 256`;
+- reads the address with `starknet_getClassHashAt`, over the config's `rpcUrls` for the destination and then the registry's defaults, and throws `RouteUnavailableError` with `reason: "recipient_not_deployed"` when no account is deployed there. An RPC failure fails the quote.
+
+The connected Starknet wallet's own address, passed as `adapter` or `destinationAdapter`, skips the deployed check. For any other undeployed address, ask the payer to confirm it is their own new wallet, then quote again with `allowUndeployedRecipient: true`:
+
+```ts
+import {
+  RouteUnavailableError,
+  type Quote,
+  type QuoteParams,
+  type WhiskEngine,
+} from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare function payerConfirms(address: string): Promise<boolean>;
+
+export async function quoteIntoStarknet(
+  params: QuoteParams,
+): Promise<Quote | null> {
+  try {
+    return await engine.quote(params);
+  } catch (err) {
+    if (
+      err instanceof RouteUnavailableError &&
+      err.reason === "recipient_not_deployed"
+    ) {
+      if (!(await payerConfirms(params.recipient.address))) return null;
+      return engine.quote({ ...params, allowUndeployedRecipient: true });
+    }
+    throw err;
+  }
+}
+```
+
+`<WhiskSend>` does this itself, with an "It's my wallet, continue" button.
+
+`RouteUnavailableReason` gains `"recipient_not_deployed"`. An exhaustive `switch` over it needs the new case:
+
+```ts
+import type { RouteUnavailableReason } from "@usewhisk/react";
+
+export function reasonMessage(reason: RouteUnavailableReason): string {
+  switch (reason) {
+    case "same_chain":
+      return "Pick a different destination.";
+    case "source_adapter_required":
+    case "destination_adapter_required":
+      return "Connect the wallet this route needs.";
+    case "recipient_account_missing":
+      return "The recipient cannot receive USDC yet.";
+    case "recipient_not_deployed":
+      return "No Starknet account is deployed at this address.";
+  }
+}
+```
+
+`InvalidAddressError` takes an optional third `message` argument, used for the Starknet messages. Code that constructs it with one or two arguments is unaffected.
+
+See [recipients](/concepts/recipients#starknet-felt-addresses).
+
+### 7. Max works before a recipient is entered
+
+`engine.maxSendable` no longer runs the recipient checks, since it only works out fees. Up to 0.2.1 it threw `InvalidAddressError` for a bridge into Solana when the payer's EVM address stood in for the recipient. It now returns the amount for bridges into Solana and Starknet before a recipient is entered. No change is needed.
+
+## New in 0.3
+
+- **`CustomFeeOutcome`** (`@usewhisk/core`), on `SendSuccess.customFee` and `SendFailure.customFee`.
+- **`EvmAdapter.supportsAtomicBatch`** and **`SendCallsOptions.atomic`**, both optional.
+- **`StellarAdapter.getTrustline`**, optional, and the **`StellarTrustline`** type (`@usewhisk/core`).
+- **`QuoteParams.allowUndeployedRecipient`**.
+- **`RouteUnavailableReason`** `"recipient_not_deployed"`.
+- **`InflightRecord.customFee`**.
+- **`getStarknetClassHashAt(chain, address, options?)`** in `@usewhisk/cctp` 0.1.1: the class hash at an address, or `null` when nothing is deployed. See [reading chain state](/reference/cctp/builders#reading-chain-state).
+
+## Upgrade checklist
+
+<Steps>
+  <Step title="Install">
+    Install `@usewhisk/react@^0.3.0`, and `@usewhisk/core@^0.3.0` if you import
+    it. Make sure nothing pins `@wagmi/core` below 2.17.
+  </Step>
+  <Step title="Check the merchant fee">
+    If you set a `feePolicy`, read `result.customFee` in `onSuccess` and
+    `onFailure` before you fulfil an order.
+  </Step>
+  <Step title="Update custom EVM adapters">
+    Leave them as they are, or add `supportsAtomicBatch` and honour `atomic` if
+    your wallet can land a batch all or nothing.
+  </Step>
+  <Step title="Update custom Stellar adapters">
+    Add `getTrustline` to any `StellarAdapter` you pass as a destination wallet.
+  </Step>
+  <Step title="Handle the new refusals">
+    Handle `recipient_not_deployed` on quotes into Starknet, and the
+    `recipient_account_missing`, `WrongChainError` and `ConfigError` failures
+    before the burn on bridges into Stellar and Starknet.
+  </Step>
+  <Step title="Test on testnet">
+    Run a testnet transfer with your fee policy on a wallet with and without
+    atomic batches, and a bridge into each of Stellar and Starknet you offer,
+    before shipping.
+  </Step>
+</Steps>

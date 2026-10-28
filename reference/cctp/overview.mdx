@@ -1,0 +1,171 @@
+---
+title: "@usewhisk/cctp"
+description: The CCTP V2 protocol layer under Whisk, usable on its own to build burns, poll Iris and build recovery mints.
+---
+
+`@usewhisk/cctp` builds the calldata for Circle's CCTP V2 contracts and talks to Circle's Iris attestation API. It never signs or sends a transaction. This is a Fast Transfer from Base Sepolia to Arbitrum Sepolia, end to end:
+
+```ts transfer.ts
+import {
+  BaseSepolia,
+  ArbitrumSepolia,
+  getBurnFees,
+  pickFeeTier,
+  buildBurnIntent,
+  pollMessages,
+  buildMintIntent,
+} from "@usewhisk/cctp";
+
+const tiers = await getBurnFees(
+  "testnet",
+  BaseSepolia.cctpDomain,
+  ArbitrumSepolia.cctpDomain,
+);
+
+const intent = buildBurnIntent({
+  source: BaseSepolia,
+  destination: ArbitrumSepolia,
+  amount: 25_000_000n, // 25 USDC in 6-decimal subunits
+  mintRecipient: "0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e",
+  fee: { tier: pickFeeTier(tiers, "fast") },
+});
+
+// Sign and send intent.calls in order with your own wallet: approve, then burn.
+for (const call of intent.calls) {
+  console.log(call.to, call.data);
+}
+
+const msg = await pollMessages(
+  { sourceDomain: BaseSepolia.cctpDomain, transactionHash: burnTxHash },
+  { network: "testnet" },
+);
+
+if (msg?.forwardState === "FAILED") {
+  const mint = buildMintIntent({
+    destination: ArbitrumSepolia,
+    message: msg.message,
+    attestation: msg.attestation,
+  });
+  // Send mint.call on Arbitrum Sepolia. The sender pays the gas.
+}
+```
+
+The burn takes the payer's USDC on the source chain as soon as the second call lands. By default the burn carries Circle's forwarding hook, so Circle's relayer submits the mint on the destination and takes its fee out of the minted amount. You only build a mint yourself when the forwarder fails or you burned without it.
+
+## Who uses it directly
+
+Most apps never import this package. `@usewhisk/core` depends on it and `@usewhisk/react` sits on top of core, and both re-export the chain registry. Reach for `@usewhisk/cctp` directly when:
+
+- You are writing your own CCTP V2 integration and want tested calldata builders and an Iris client, without Whisk's engine, wallet adapters or transfer state.
+- You run a backend that watches burns, checks Iris, or mints for stuck transfers.
+- You need a lower level piece the engine does not expose, such as the raw fee tiers, a decoded CCTP message or a Solana PDA.
+
+If you want quotes, approvals, sending, receipts and recovery handled for you, use the engine instead: see [the core engine](/headless/core-engine).
+
+## Where it sits
+
+Imports only point down:
+
+```text
+@usewhisk/cctp   chain registry, ABIs, Iris client, fee maths, burn and mint builders
+      ↑
+@usewhisk/core   engine: quotes, wallet adapters, transfer state, recovery
+      ↑
+@usewhisk/react  provider, hooks, widget
+```
+
+The package holds no wallet state and no signer. Every builder returns plain data: EVM `{ to, data, value }` calls, a Solana instruction, a Soroban invocation or a Starknet `Call`. Whoever holds the key submits it. The only network calls are to Iris and, for the few RPC helpers, to the chain's JSON-RPC endpoints.
+
+## Install
+
+```bash
+pnpm add @usewhisk/cctp
+```
+
+`viem`, `@solana/web3.js`, `@solana/spl-token`, `@stellar/stellar-sdk` and `starknet` are direct dependencies, so the builders work without extra installs. Node 20 or later. The package ships ESM and CommonJS builds.
+
+Three subpath entries load less code when you only need one part:
+
+```ts
+import { getChain, Base } from "@usewhisk/cctp/chains";
+import { tokenMessengerV2Abi, usdcAbi } from "@usewhisk/cctp/abi";
+import { getMessages } from "@usewhisk/cctp/iris";
+```
+
+`VERSION` is a version string. The published 0.1.1 still sets it to `"0.1.0"`, so read `package.json` when you need the installed version exactly.
+
+## Main entry points
+
+| Area           | Exports                                                                                                                    | Page                                 |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Chain registry | `CHAINS`, `getChain`, `chainByDomain`, `chainByEvmChainId`, one constant per chain                                         | [Chains](/reference/cctp/chains)     |
+| Burns          | `buildBurnIntent`, `buildBurnWithFeesIntent`, `buildSolanaBurnIntent`, `buildStellarBurnIntent`, `buildStarknetBurnIntent` | [Builders](/reference/cctp/builders) |
+| Mints          | `buildMintIntent`, `buildSolanaReceiveIntent`, `buildStellarMintIntent`, `buildStarknetReceiveIntent`                      | [Builders](/reference/cctp/builders) |
+| Iris           | `getMessages`, `pollMessages`, `reattest`, `getSignedBurnQuote`, `getFastBurnAllowance`                                    | [Iris](/reference/cctp/iris)         |
+| Fees           | `getBurnFees`, `pickFeeTier`, `computeMaxFee`, `getStandardMinFee`                                                         | [Fees](/reference/cctp/fees)         |
+
+## Units
+
+- EVM, Solana and Starknet USDC amounts are `bigint` subunits with 6 decimals: `25_000_000n` is 25 USDC.
+- Stellar's USDC has 7 decimals. The Stellar builders take 7-decimal subunits; CCTP messages always carry 6. See [Stellar precision](/reference/cctp/builders#stellar-precision).
+- Iris's protocol fee comes back in basis points with up to two decimals. The package holds it as hundredths of a basis point, so `1.3` bps is `130n`. See [Fees](/reference/cctp/fees).
+- Native gas is not USDC, except on Arc, where it is USDC with 18 decimals. Nothing in this package pays gas.
+
+Network (mainnet or testnet) is a property of each chain entry. Functions that call Iris take a `network` argument; pass `source.network` so a testnet burn never asks the mainnet host.
+
+## ABIs
+
+`tokenMessengerV2Abi`, `tokenMessengerWithFeesAbi`, `messageTransmitterV2Abi` and `usdcAbi` are `as const` arrays, typed for viem. They cover what Whisk calls and decodes:
+
+| ABI                         | Functions                                                                                           | Events                           |
+| --------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `tokenMessengerV2Abi`       | `depositForBurn`, `depositForBurnWithHook`                                                          | `DepositForBurn`                 |
+| `tokenMessengerWithFeesAbi` | `depositForBurnWithFees`, `getFee`, `tokenMessenger`                                                |                                  |
+| `messageTransmitterV2Abi`   | `receiveMessage`, `usedNonces`                                                                      | `MessageSent`, `MessageReceived` |
+| `usdcAbi`                   | `balanceOf`, `allowance`, `decimals`, `approve`, `transfer`, `nonces`, `DOMAIN_SEPARATOR`, `permit` | `Transfer`, `Approval`           |
+
+## Errors
+
+Every failure the package raises is a `CctpError` with a stable `code` (type `CctpErrorCode`). Switch on the subclass or on `code`, not on `message`.
+
+```ts
+import {
+  buildBurnIntent,
+  InvalidInputError,
+  IrisRateLimitedError,
+  ProtocolError,
+  isCctpError,
+} from "@usewhisk/cctp";
+
+try {
+  buildBurnIntent(input);
+} catch (err) {
+  if (err instanceof InvalidInputError) {
+    console.error("bad input", err.code, err.message);
+  } else if (err instanceof ProtocolError) {
+    console.error("route or amount refused", err.code);
+  } else if (err instanceof IrisRateLimitedError) {
+    console.error("Iris blocked until", new Date(err.retryAt));
+  } else if (isCctpError(err)) {
+    console.error(err.code);
+  } else {
+    throw err;
+  }
+}
+```
+
+| Class               | Means                                              | Codes                                                                                                                  |
+| ------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `CctpError`         | Base class. `code`, `message`, optional `cause`.   | any                                                                                                                    |
+| `InvalidInputError` | The caller passed bad data. Fix the calling code.  | `invalid_address`, `invalid_bytes32`, `invalid_amount`, `invalid_chain`, `invalid_domain`, `invalid_input`, `no_route` |
+| `ProtocolError`     | A CCTP rule refused the call, or every RPC failed. | `amount_too_large`, `fee_unavailable`, `tier_not_found`, `no_route`, `rpc_unavailable`                                 |
+| `UnsupportedError`  | The chain or ecosystem cannot serve this call.     | `unsupported_chain`, `unsupported_ecosystem`                                                                           |
+| `IrisError`         | Base for every Iris failure.                       | `iris_*`                                                                                                               |
+
+`UnknownChainError` (from the registry), `InvalidAddressError` and `InvalidBytes32Error` (from the bytes32 helpers) extend `InvalidInputError`. The Iris subclasses (`IrisHttpError`, `IrisRateLimitedError`, `IrisNetworkError`, `IrisParseError`, `IrisAbortedError`) are covered on the [Iris page](/reference/cctp/iris#errors). `isCctpError(value)` is an `instanceof CctpError` type guard.
+
+<Note>
+  The Solana builder throws `amount_too_large` as an `InvalidInputError`, while
+  the EVM builder throws it as a `ProtocolError`. Match on `err.code` if you
+  handle both.
+</Note>

@@ -1,0 +1,159 @@
+---
+title: "Installation"
+description: "Packages, peer dependencies, stylesheets and framework setup for Whisk."
+---
+
+For a React app, install the widget package and its peers:
+
+```bash
+npm install @usewhisk/react @tanstack/react-query viem
+```
+
+Then import the stylesheet once and render the widget:
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config}>
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+`pnpm add`, `yarn add` and `bun add` work the same way. Every package needs Node 20 or later.
+
+## Packages
+
+| Package           | Version | Install it when                                                                     |
+| ----------------- | ------- | ----------------------------------------------------------------------------------- |
+| `@usewhisk/react` | 0.3.0   | You render the widget or use the React hooks.                                       |
+| `@usewhisk/core`  | 0.3.0   | You run the engine outside React, or import from it directly in a React app.        |
+| `@usewhisk/cctp`  | 0.1.1   | You use the CCTP protocol layer on its own (chain registry, builders, Iris client). |
+
+`@usewhisk/react` depends on `@usewhisk/core`, and `@usewhisk/core` depends on `@usewhisk/cctp`, so one install brings all three. `@usewhisk/react` re-exports the engine types, errors, chain helpers and amount helpers you are likely to need, so most React apps never import `@usewhisk/core` by name.
+
+Without React:
+
+```bash
+npm install @usewhisk/core viem
+```
+
+See [core engine](/headless/core-engine) and [server usage](/headless/server).
+
+## Peer dependencies
+
+| Package           | Peer                    | Range         |
+| ----------------- | ----------------------- | ------------- |
+| `@usewhisk/react` | `react`                 | `>=18`        |
+|                   | `react-dom`             | `>=18`        |
+|                   | `@tanstack/react-query` | `>=5`         |
+|                   | `viem`                  | `>=2.57.5 <3` |
+| `@usewhisk/core`  | `viem`                  | `>=2.57.5 <3` |
+| `@usewhisk/cctp`  | none                    |               |
+
+`@usewhisk/cctp` lists `viem` (`>=2.57.5 <3`) as a regular dependency, so it shares your app's copy when the versions agree.
+
+Regular dependencies of `@usewhisk/react`, installed for you:
+
+- EVM: `wagmi` and `@wagmi/core` (`^2.17.0`)
+- Solana: `@solana/web3.js`, `@solana/wallet-adapter-react`, `@solana/wallet-adapter-base`
+- Stellar: `@stellar/stellar-sdk`, `@creit.tech/stellar-wallets-kit`
+- Starknet: `starknet`, `@starknet-io/get-starknet-core`
+
+`@usewhisk/react` 0.3 needs `@wagmi/core` 2.17 or later, the first version with the EIP-5792 actions (`getCapabilities`, `sendCalls`, `waitForCallsStatus`) its EVM adapter uses. If your lockfile, overrides or resolutions hold `@wagmi/core` below 2.17, raise them.
+
+You do not install wallet libraries per ecosystem. Each ecosystem's provider is mounted only when its factory is in `config.wallets`. See [wallets](/wallets).
+
+## Stylesheets
+
+| Import                       | What it is                                                                                    |
+| ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `@usewhisk/react/styles.css` | The widget's styles and default theme. Required for the bundled components.                   |
+| `@usewhisk/react/fonts.css`  | Optional. Loads Inter, Familjen Grotesk and Geist Mono from jsDelivr for apps that lack them. |
+
+```tsx
+import "@usewhisk/react/styles.css";
+import "@usewhisk/react/fonts.css";
+```
+
+Every rule in `styles.css` is scoped under `[data-whisk]`, the element `WhiskProvider` renders, so it does not restyle the rest of your page. Whisk loads no fonts by default: the widget asks for Inter and falls back to system fonts. Import `fonts.css` only if your app does not already load those faces. See [fonts](/theming/fonts) and [theming](/theming/overview).
+
+## Tailwind
+
+`@usewhisk/react/tailwind` exports `whiskTheme()`, a Tailwind preset that maps the `--whisk-*` CSS variables to classes such as `bg-whisk-primary` and `rounded-whisk`. The variables themselves still come from `styles.css`.
+
+```ts tailwind.config.ts
+import { whiskTheme } from "@usewhisk/react/tailwind";
+
+export default {
+  presets: [whiskTheme()],
+  content: ["./src/**/*.{ts,tsx}"],
+};
+```
+
+See [Tailwind](/theming/tailwind).
+
+## Headless entry
+
+`@usewhisk/react/headless` exports the provider, config builders, wallet factories and hooks, without the visual components. It needs no stylesheet.
+
+```ts
+import {
+  WhiskProvider,
+  createWhiskConfig,
+  evm,
+  useWhisk,
+} from "@usewhisk/react/headless";
+```
+
+See [React headless](/headless/react-headless).
+
+## Next.js
+
+`WhiskProvider` and the hooks are client components. In the App Router, put the provider and the widget in a file that starts with `"use client"`, and load that file with `next/dynamic` and `ssr: false`, so wagmi and the wallet libraries do not start during prerender:
+
+```tsx app/pay-gate.tsx
+"use client";
+
+import dynamic from "next/dynamic";
+
+const Pay = dynamic(() => import("./pay"), { ssr: false });
+
+export function PayGate() {
+  return <Pay />;
+}
+```
+
+Import `@usewhisk/react/styles.css` from your root layout. Environment variables read in the browser, such as a WalletConnect project ID, need the `NEXT_PUBLIC_` prefix. The `ecommerce-checkout`, `invoice-link` and `themed-saas` examples in the Whisk repository use this setup with Next.js 15.
+
+## Vite with Solana
+
+`@solana/web3.js` expects Node's `Buffer` global. Next.js provides it; Vite does not, so the first Solana operation throws `Buffer is not defined`. If you use `solana()` on Vite, install `buffer` and set the global at the top of your entry file, before anything imports Whisk:
+
+```bash
+npm install buffer
+```
+
+```ts src/main.tsx
+import { Buffer } from "buffer";
+
+if (typeof globalThis.Buffer === "undefined") {
+  globalThis.Buffer = Buffer;
+}
+```
+
+Skip this if you do not use Solana. The `donate-button` and `payroll-batch` examples run on Vite 6 with this polyfill.

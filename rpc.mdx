@@ -1,0 +1,154 @@
+---
+title: "RPC endpoints"
+description: "Which RPCs Whisk uses by default, how to set your own, and the per-ecosystem settings."
+---
+
+Whisk works out of the box on public RPC endpoints. For production, pass your own. On EVM chains the same map goes to two places, the engine and the wallet:
+
+```ts whisk.ts
+import { createWhiskConfig, evm } from "@usewhisk/react";
+
+const rpcUrls = {
+  Base: "https://base-mainnet.example.com/YOUR_KEY",
+  Arc: [
+    "https://arc-mainnet.example.com/YOUR_KEY",
+    "https://arc-backup.example.com/YOUR_KEY",
+  ],
+};
+
+export const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base", "Arc"], rpcUrls })],
+  chains: ["Base", "Arc"],
+  rpcUrls,
+});
+```
+
+Each entry is keyed by chain id and takes one URL or an array of URLs.
+
+## Why set your own
+
+The defaults are free public endpoints. They are rate limited, they fail more often than paid ones, and every app using them shares the same limits. A failing RPC does not lose funds, but it shows up as slow or failed quotes, a Max button without a balance, a confirmation that hangs, or a resume that cannot see the burn. Use a provider you pay for, or run your own node, for every chain you list on mainnet.
+
+Anything in your client bundle is visible to your users, RPC keys included. Use keys that your provider lets you restrict to your domain.
+
+## Two settings for EVM chains
+
+| Setting                          | Used by                   | What it reads                                                                                                                        |
+| -------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `createWhiskConfig({ rpcUrls })` | The engine                | USDC balances for the Max button, Arc gas prices, Standard burn minimum fees, block numbers, and burn and mint status when resuming. |
+| `evm({ rpcUrls })`               | wagmi, through the wallet | Transaction receipts after the wallet submits, and other wagmi reads.                                                                |
+
+The wallet itself broadcasts transactions through its own RPC, which Whisk does not control.
+
+The two settings fall back differently:
+
+- **Engine.** Your URLs are tried in order, then the chain's default RPCs from the registry. A URL that errors, returns an HTTP error or returns an unusable answer is skipped, and the next one is tried. The engine reaches the public defaults only when all of yours fail.
+- **wagmi.** A single string becomes viem's `http(url)` transport, with no fallback. An array becomes a viem `fallback` transport ranked by latency. A chain with no entry uses viem's default public RPC for that chain.
+
+If you bring your own wagmi config, `evm({ rpcUrls })` has no effect; set the transports in your wagmi config instead. See [wallets](/wallets#bring-your-own-wagmi-config).
+
+## Default endpoints
+
+Every registry entry carries its defaults in `defaultRpcUrls`:
+
+```ts
+import { getChain } from "@usewhisk/react";
+
+console.log(getChain("Base").defaultRpcUrls);
+console.log(getChain("Solana").defaultRpcUrls);
+```
+
+The full list per chain is in the [chain reference](/reference/cctp/chains).
+
+## Solana, Stellar and Starknet
+
+The non-EVM wallet factories each take their own endpoint. For Stellar and Starknet, the engine also reads the chain directly when it resumes a transfer, so set `rpcUrls` for those chains as well:
+
+```ts whisk.ts
+import { createWhiskConfig, solana, stellar, starknet } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    solana({
+      network: "mainnet-beta",
+      endpoint: "https://solana-mainnet.example.com/YOUR_KEY",
+    }),
+    stellar({
+      network: "public",
+      rpcUrl: "https://soroban-mainnet.example.com/YOUR_KEY",
+    }),
+    starknet({
+      network: "mainnet",
+      rpcUrl: "https://starknet-mainnet.example.com/YOUR_KEY",
+    }),
+  ],
+  chains: ["Solana", "Stellar", "Starknet", "Base"],
+  rpcUrls: {
+    Stellar: "https://soroban-mainnet.example.com/YOUR_KEY",
+    Starknet: "https://starknet-mainnet.example.com/YOUR_KEY",
+  },
+});
+```
+
+<AccordionGroup>
+  <Accordion title="Solana">
+    `solana({ endpoint })` sets the RPC for the Solana connection, which Whisk uses to fetch blockhashes, confirm transactions, and read accounts (such as the recipient's USDC account before a burn into Solana). The engine reads Solana only through that connection, so `rpcUrls.Solana` is not needed.
+
+    Default: `https://api.devnet.solana.com` for `"devnet"` and `https://api.mainnet-beta.solana.com` for `"mainnet-beta"`. Solana's public endpoints are heavily rate limited; set your own before you go to mainnet.
+
+  </Accordion>
+  <Accordion title="Stellar">
+    `stellar({ rpcUrl })` takes a Soroban RPC URL (Stellar RPC), not a Horizon URL. Whisk uses it to load the payer's account, simulate each contract call, submit it and wait for it to land.
+
+    Default: `https://soroban-testnet.stellar.org` on testnet and `https://mainnet.sorobanrpc.com` on public. The registry's defaults, which the engine falls back to, are `https://soroban-testnet.stellar.org` on testnet and `https://soroban-rpc.mainnet.stellar.gateway.fm` then `https://mainnet.sorobanrpc.com` on mainnet.
+
+    `rpcUrls.Stellar` on the config is what the engine uses to check whether a Stellar mint already happened when it resumes a transfer.
+
+  </Accordion>
+  <Accordion title="Starknet">
+    `starknet({ rpcUrl })` is polled for transaction receipts after the wallet submits. The chain's registry defaults are tried after it.
+
+    Default: `https://starknet-sepolia-rpc.publicnode.com` on Sepolia and `https://starknet-rpc.publicnode.com` on mainnet.
+
+    Whisk reads receipts with plain JSON-RPC (`starknet_getTransactionReceipt`) rather than through starknet.js, so it does not reject a node for running a newer spec version. The fields it reads are the same from Starknet RPC 0.8 to 0.10. Point it at a node that serves one of those versions.
+
+    `rpcUrls.Starknet` on the config is what the engine uses to check whether a Starknet mint already happened when it resumes a transfer.
+
+  </Accordion>
+</AccordionGroup>
+
+## ENS lookups
+
+The default recipient resolver looks up ENS names on Ethereum (and on Sepolia first for testnet destinations). It uses its own list of public, CORS-friendly endpoints, exported as `DEFAULT_ENS_RPC_URLS` and `DEFAULT_ENS_SEPOLIA_RPC_URLS`. To use your own, build the resolver with `rpcUrl`:
+
+```ts whisk.ts
+import { createDefaultResolver, createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base"] })],
+  chains: ["Base"],
+  resolver: createDefaultResolver({
+    rpcUrl: "https://eth-mainnet.example.com/YOUR_KEY",
+  }),
+});
+```
+
+`rpcUrl` takes one URL or an array. It replaces the endpoints for both the mainnet and the Sepolia lookups, so in an app with testnet destinations it should not be a mainnet-only URL. See [recipients](/concepts/recipients).
+
+## Without React
+
+`createWhisk` in `@usewhisk/core` takes the same `rpcUrls` option as `createWhiskConfig`, with the same fallback to the registry defaults:
+
+```ts server.ts
+import { createWhisk } from "@usewhisk/core";
+
+export const engine = createWhisk({
+  chains: ["Base", "Arc"],
+  rpcUrls: {
+    Base: process.env.BASE_RPC_URL,
+    Arc: process.env.ARC_RPC_URL,
+  },
+});
+```
+
+On a server, your wallet adapters bring their own RPC clients. See [server usage](/headless/server).

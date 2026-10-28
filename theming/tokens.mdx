@@ -1,0 +1,169 @@
+---
+title: Tokens
+description: Every --whisk-* CSS variable, the theme token that sets it, and what it colors in the widget.
+---
+
+Each theme token maps to one `--whisk-*` CSS variable on the `[data-whisk]` element. Set tokens through the `theme` prop, or set the variables in your own stylesheet.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider
+      config={config}
+      theme={{
+        preset: "light",
+        tokens: {
+          primary: "#0f766e",
+          primaryFg: "#ffffff",
+          radius: "0.375rem",
+        },
+      }}
+    >
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+## Colors
+
+Defaults are the light and dark palettes in `styles.css`. Any CSS color works, since the stylesheet mixes colors with `color-mix(in srgb, …)` rather than splitting them into channels (Safari 16.4+, Chrome 111+, Firefox 113+).
+
+| Token           | CSS variable             | Light       | Dark        | What it colors                                                                     |
+| --------------- | ------------------------ | ----------- | ----------- | ---------------------------------------------------------------------------------- |
+| `bg`            | `--whisk-bg`             | `#cdc3a3`   | `#2a1d21`   | Field, banner and chip backgrounds; the base the tints are mixed into.             |
+| `fg`            | `--whisk-fg`             | `#56363d`   | `#e4e2d4`   | Body text, values, input text.                                                     |
+| `fgMuted`       | `--whisk-fg-muted`       | `fg` at 75% | `fg` at 75% | Labels, help text, placeholders, the attribution line.                             |
+| `card`          | `--whisk-card`           | `bg`        | `#33232a`   | The card background.                                                               |
+| `cardFg`        | `--whisk-card-fg`        | `fg`        | `fg`        | Text color set on the card.                                                        |
+| `border`        | `--whisk-border`         | `#b09382`   | `#5c3f46`   | Borders of the card, fields, banners and dividers.                                 |
+| `input`         | `--whisk-input`          | `border`    | `#5c3f46`   | Border of the `.whisk-input` class. No 0.3 component uses it; fields use `border`. |
+| `ring`          | `--whisk-ring`           | `primary`   | `primary`   | Focus ring on buttons and fields.                                                  |
+| `primary`       | `--whisk-primary`        | `#d65c3c`   | `#d65c3c`   | Primary buttons, the active step's dot, focus outlines.                            |
+| `primaryFg`     | `--whisk-primary-fg`     | `#fbf8ee`   | `#fbf8ee`   | Text on primary buttons, the check in a finished step.                             |
+| `success`       | `--whisk-success`        | `#6b8e4e`   | `#87a468`   | Finished steps, the connected-network dot, success badges.                         |
+| `warning`       | `--whisk-warning`        | `#d69a3c`   | `#e1a854`   | Warning banners (fee rise, unfinished transfers).                                  |
+| `destructive`   | `--whisk-destructive`    | `#b23a3a`   | `#c84a4a`   | Error banners, invalid fields, error text, failed steps.                           |
+| `destructiveFg` | `--whisk-destructive-fg` | `#fbf8ee`   | `#fbf8ee`   | The cross in a failed step.                                                        |
+
+## Shape and type
+
+These are the same in light and dark.
+
+| Token         | CSS variable           | Default                                 | What it sets                                        |
+| ------------- | ---------------------- | --------------------------------------- | --------------------------------------------------- |
+| `radius`      | `--whisk-radius`       | `0.625rem`                              | Fields, buttons, banners.                           |
+| `radiusSm`    | `--whisk-radius-sm`    | `0.375rem`                              | Badges.                                             |
+| `radiusMd`    | `--whisk-radius-md`    | `0.625rem`                              | Tabs, the quote summary, dropdown menus.            |
+| `radiusLg`    | `--whisk-radius-lg`    | `1rem`                                  | The card and the connect dialog.                    |
+| `borderWidth` | `--whisk-border-w`     | `0.5px`                                 | Card, field and banner borders.                     |
+| `font`        | `--whisk-font`         | `"Inter", -apple-system, …, sans-serif` | All widget text.                                    |
+| `fontDisplay` | `--whisk-font-display` | `"Familjen Grotesk", "Inter", …`        | Defined, but not read by any 0.3 component.         |
+| `fontMono`    | `--whisk-font-mono`    | `"JetBrains Mono", "Geist Mono", …`     | Addresses, transaction hashes, the recipient field. |
+
+`radiusMd` has the same default as `radius` but is a separate variable: changing `radius` does not change it. See [fonts](/theming/fonts) for the full stacks.
+
+## In a stylesheet
+
+Set the variables on `[data-whisk]` in a stylesheet loaded after `@usewhisk/react/styles.css`. This works with `"light"`, `"dark"` and `"auto"`, which write no variables inline.
+
+```css app.css
+[data-whisk] {
+  --whisk-bg: #ffffff;
+  --whisk-card: #ffffff;
+  --whisk-fg: #111827;
+  --whisk-border: #e5e7eb;
+  --whisk-primary: #2b3cff;
+  --whisk-primary-fg: #ffffff;
+  --whisk-radius: 0.5rem;
+  --whisk-radius-md: 0.5rem;
+  --whisk-radius-lg: 0.75rem;
+  --whisk-border-w: 1px;
+}
+```
+
+Some variables default to another one: `--whisk-card` to `--whisk-bg` in light, `--whisk-card-fg` to `--whisk-fg`, `--whisk-ring` to `--whisk-primary`, and `--whisk-fg-muted` to `--whisk-fg` at 75%. Overriding the source moves those with it unless you set them too. The dark palette sets `--whisk-card` and `--whisk-input` to their own values.
+
+For separate light and dark values, see [overriding with your own stylesheet](/theming/overview#overriding-with-your-own-stylesheet).
+
+## Through the `theme` prop
+
+### `{ preset, tokens }`
+
+Takes any subset of the tokens above (`WhiskThemeTokens`). `preset` is a preset name or `"auto"`. The tokens are written as inline variables on top of the preset, so they beat any stylesheet, and they apply to light and dark alike.
+
+### A full `WhiskTheme`
+
+For a palette of your own, pass a `WhiskTheme`. These fields are required: `colorMode` (`"light"` or `"dark"`), `bg`, `fg`, `border`, `input`, `card`, `primary`, `primaryFg`, `success`, `warning`, `destructive`, `destructiveFg`. The rest are optional; `cardFg` defaults to `fg` and `ring` to `primary`, and the others keep their `styles.css` defaults.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+  type WhiskTheme,
+} from "@usewhisk/react";
+
+const brand: WhiskTheme = {
+  colorMode: "dark",
+  bg: "#0b1020",
+  fg: "#e6e9f2",
+  border: "#27304a",
+  input: "#1a2238",
+  card: "#11182c",
+  primary: "#7c9cff",
+  primaryFg: "#0b1020",
+  success: "#4ade80",
+  warning: "#fbbf24",
+  destructive: "#f87171",
+  destructiveFg: "#0b1020",
+  fontMono: '"IBM Plex Mono", ui-monospace, monospace',
+};
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config} theme={brand}>
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+`colorMode` sets `data-whisk-theme`, and `"dark"` also adds the `dark` class. Every color is written inline, so a full theme looks the same whatever the visitor's system setting.
+
+## Converting tokens to variables
+
+`themeToCssVars(theme)` turns a `WhiskTheme` into the variable map the provider writes, filling `cardFg` and `ring` from `fg` and `primary`. `tokensToCssVars(tokens)` does the same for a partial set and leaves out anything unset.
+
+```ts vars.ts
+import {
+  getThemePreset,
+  themeToCssVars,
+  tokensToCssVars,
+} from "@usewhisk/react";
+
+const all = themeToCssVars(getThemePreset("emerald"));
+const some = tokensToCssVars({ primary: "#10b981", radiusLg: "1.25rem" });
+
+console.log(all["--whisk-bg"], some);
+```
+
+Both return a `Record<string, string>` keyed by variable name, such as `{ "--whisk-primary": "#10b981", "--whisk-radius-lg": "1.25rem" }`. Use them to style your own `[data-whisk]` element, generate a stylesheet at build time, or preview a palette.

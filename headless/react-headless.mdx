@@ -1,0 +1,127 @@
+---
+title: React without the widget
+sidebarTitle: React headless
+description: The @usewhisk/react/headless entry gives you the provider and hooks with no Whisk components or styles.
+---
+
+`@usewhisk/react/headless` is the React package minus its UI: the provider,
+the config builders, the hooks and the core re-exports, with no components,
+theme helpers or CSS.
+
+```tsx App.tsx
+import { useConnect, useDisconnect } from "wagmi";
+import {
+  WhiskProvider,
+  createWhiskConfig,
+  evm,
+  useWhisk,
+} from "@usewhisk/react/headless";
+
+const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base_Sepolia", "Arc_Testnet"] })],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+
+function Wallet() {
+  const { isConnected, address } = useWhisk();
+  const { connectors, connect, isPending } = useConnect();
+  const { disconnect } = useDisconnect();
+
+  if (isConnected) {
+    return <button onClick={() => disconnect()}>Disconnect {address}</button>;
+  }
+  return (
+    <div>
+      {connectors.map((connector) => (
+        <button
+          key={connector.uid}
+          disabled={isPending}
+          onClick={() => connect({ connector })}
+        >
+          {connector.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function App() {
+  return (
+    <WhiskProvider config={config}>
+      <Wallet />
+    </WhiskProvider>
+  );
+}
+```
+
+Everything you render is yours. Do not import `@usewhisk/react/styles.css`;
+nothing here uses it.
+
+## What the entry leaves out
+
+Both entries export the same provider, config builders (`createWhiskConfig`,
+`evm`, `solana`, `stellar`, `starknet`), hooks, resolvers, errors, fee and
+chain helpers, receipt and refund helpers, and amount formatting. The headless
+entry does not export:
+
+| Left out                | Exports                                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Widget components       | `WhiskSend`, `WhiskReceipt`, `ResumeList` and their props types                                                             |
+| UI primitives           | `Banner`, `Button`, `Card`, `ChainPicker`, `ConnectModal`, `FieldBox`, `PoweredByWhisk`, `StepRail` and their props types   |
+| Theme helpers           | `getThemePreset`, `listThemeNames`, `resolveTheme`, `themePresets`, `themeToCssVars`, `tokensToCssVars` and the theme types |
+| Browser in-flight store | `createBrowserInflightStore`                                                                                                |
+
+`createBrowserInflightStore` is missing only as an export. `<WhiskProvider>`
+still uses it by default, so transfers are kept in `localStorage` and survive
+a reload. To pass a store of your own, build it with
+`createStorageInflightStore` or `createMemoryInflightStore` from
+`@usewhisk/core`.
+
+Both entries load the provider and hooks from one shared chunk of the
+published build, so they share one context. Importing `ConnectModal` from the
+main entry and everything else from `/headless` works.
+
+## Connecting wallets yourself
+
+Without `<ConnectModal>`, connecting is up to you:
+
+- **EVM:** use wagmi's own hooks (`useConnect`, `useDisconnect`) inside the
+  provider, as above. `evm()` sets up the wagmi config and connectors, and
+  `useWhisk` reads the account from it. Add `wagmi` 2 to your dependencies so
+  your app and Whisk share one copy; two copies mean two contexts, and Whisk
+  will not see the account.
+- **Solana:** `solana()` mounts the Solana wallet adapter's
+  `ConnectionProvider` and `WalletProvider`, so `useWallet` from
+  `@solana/wallet-adapter-react` (0.15) connects a Wallet Standard wallet.
+- **Stellar and Starknet:** 0.3 has no public hook to connect these wallets.
+  Render `<ConnectModal>` from the main entry for them, or drive the engine
+  with your own `StellarAdapter` or `StarknetAdapter`.
+
+## What the provider still renders
+
+`<WhiskProvider>` wraps its children in a `<div data-whisk>` and adds an empty
+`<div data-whisk-portal>` after them. Lay out your own markup knowing the
+wrapper is there. The `theme` prop still applies to it: `"dark"` adds
+`class="dark"`, which turns on Tailwind `dark:` variants inside it if your app
+uses the class strategy, and the named palettes and token overrides set
+`--whisk-*` variables inline, which do nothing without Whisk's CSS. The default
+`"light"` adds neither.
+
+It also mounts wagmi, react-query and, when configured, the Solana, Stellar
+and Starknet providers. An outer `WagmiProvider` or `QueryClientProvider` is
+reused instead of mounting a second one.
+
+## Building the UI
+
+From here the hooks do the work:
+
+- [`useWhisk`](/hooks/use-whisk) for quote and send with the EVM wallet, and a
+  full custom send component built on Whisk's state machine.
+- [`useAdapterFor`](/hooks/wallet-adapters) and
+  [`useWhiskEngine`](/hooks/use-whisk-engine) for other ecosystems and for
+  balances and in-flight transfers.
+- [`useReceipt`](/hooks/use-receipt) for transfer status.
+- [`useRefund`](/hooks/use-refund) for merchant refunds.
+
+If you are not using React at all, use [the core engine](/headless/core-engine)
+directly.

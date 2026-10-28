@@ -1,0 +1,166 @@
+---
+title: WhiskReceipt
+description: A status card for one transfer, polled from Circle's Iris API, with a button that finishes a bridge that has not minted.
+---
+
+`WhiskReceipt` shows where a transfer is, from its source transaction hash. Use it on an order page, after a payment, or behind a link you send the payer.
+
+```tsx Status.tsx
+import { WhiskReceipt } from "@usewhisk/react";
+
+export function Status() {
+  return (
+    <WhiskReceipt
+      sourceChain="Base_Sepolia"
+      sourceTxHash="0x9f2c0a7e4b1d3c5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6"
+      destinationChain="Arc_Testnet"
+    />
+  );
+}
+```
+
+For a bridge, `sourceTxHash` is the burn. For a same-chain send, pass the same chain as source and destination and the transfer's hash; the receipt shows it as settled straight away.
+
+## Props
+
+<ParamField path="sourceChain" type="Chain" required>
+  The chain the transfer started on.
+</ParamField>
+
+<ParamField path="sourceTxHash" type="string | undefined" required>
+  The burn (bridge) or transfer (same-chain) transaction. While it is
+  `undefined` the card asks for a hash and nothing is polled, so you can render
+  it before the hash is known.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain" required>
+  Where the USDC is minted. Equal to `sourceChain` for a same-chain send.
+</ParamField>
+
+<ParamField path="destinationTxHash" type="string">
+  The mint transaction, when you already have it. Polling stops and the receipt
+  shows as settled, with a link to the mint.
+</ParamField>
+
+<ParamField path="hasError" type="boolean">
+  Shows the failed stage, for example when `WhiskSend` already reported a
+  `SendFailure`. Polling stops.
+</ParamField>
+
+<ParamField path="title" type="string" default='"Transfer status"'>
+  Heading at the top of the card.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the chain line.
+</ParamField>
+
+<ParamField path="pollIntervalMs" type="number" default="3000">
+  How often Iris is polled, in milliseconds.
+</ParamField>
+
+<ParamField path="pollTimeoutMs" type="number" default="600000">
+  How long to keep polling, in milliseconds (10 minutes). The clock restarts
+  only when `sourceChain` or `sourceTxHash` changes.
+</ParamField>
+
+## What it shows
+
+- **Header:** the title, then the source chain, with `→ destination` on a bridge.
+- **Stage banner:** one of the stages below, with a short explanation.
+- **Step rail:** the transfer's steps as a [`StepRail`](/widget/primitives#steprail).
+- **Links:** the source transaction on the source chain's explorer, and the destination transaction when `destinationTxHash` is set.
+- "Checking attestation status…" while the first poll is in flight, and an "Iris polling failed." banner if a poll throws.
+
+| Stage                  | Label                      | When                                                  |
+| ---------------------- | -------------------------- | ----------------------------------------------------- |
+| `submitted`            | Submitted                  | Iris has not seen the burn yet.                       |
+| `awaiting_attestation` | Confirming on source chain | Circle is attesting the burn.                         |
+| `attested`             | Minting on destination     | The attestation is ready; the mint has not been seen. |
+| `settled`              | Settled                    | A same-chain send, or `destinationTxHash` is known.   |
+| `failed`               | Failed                     | `hasError` was passed.                                |
+
+The labels and explanations come from `RECEIPT_STAGE_LABELS` and `RECEIPT_STAGE_HELP` in `@usewhisk/core`. To word them differently, build your own card with [`useReceipt`](/hooks/use-receipt).
+
+Iris reports when an attestation is ready, not when the mint lands. A bridge whose mint went through but whose `destinationTxHash` you did not pass stays at "Minting on destination". Pass the mint hash when you have it.
+
+## Finishing a transfer
+
+On a bridge that is not settled, the receipt shows a **Finish transfer** button. It calls `engine.resumeFromTx` with the burn hash: it waits for the attestation, asks Circle for a new one if the old one expired, and mints, unless Circle's Forwarder mints it or the destination already received it. The burn is never signed again, so pressing it cannot charge the payer twice.
+
+When the mint needs a wallet on the destination, the receipt uses whichever connected wallet matches the destination chain's ecosystem. On success the button is replaced by "Delivered. The recipient has the USDC." If it fails, the error shows under the button and the payer can try again. See [recovery](/concepts/recovery).
+
+## After a send
+
+Pick the source hash out of the result's steps and switch to a receipt:
+
+```tsx Checkout.tsx
+import { useState } from "react";
+import {
+  WhiskReceipt,
+  WhiskSend,
+  type Chain,
+  type SendFailure,
+  type SendSuccess,
+} from "@usewhisk/react";
+
+type Receipt = {
+  sourceTxHash: string | undefined;
+  destinationTxHash?: string;
+  failed: boolean;
+};
+
+const SOURCE: Chain = "Base_Sepolia";
+const DESTINATION: Chain = "Arc_Testnet";
+
+function sourceHash(result: SendSuccess | SendFailure) {
+  return result.steps.find((s) => s.name === "burn" || s.name === "transfer")
+    ?.txHash;
+}
+
+export function Checkout() {
+  const [receipt, setReceipt] = useState<Receipt | null>(null);
+
+  if (receipt) {
+    return (
+      <WhiskReceipt
+        sourceChain={SOURCE}
+        sourceTxHash={receipt.sourceTxHash}
+        destinationChain={DESTINATION}
+        {...(receipt.destinationTxHash && {
+          destinationTxHash: receipt.destinationTxHash,
+        })}
+        hasError={receipt.failed}
+      />
+    );
+  }
+
+  return (
+    <WhiskSend
+      tabs={["bridge"]}
+      sourceChain={SOURCE}
+      destinationChain={DESTINATION}
+      onSuccess={(r) =>
+        setReceipt({
+          sourceTxHash: sourceHash(r),
+          ...(r.finalTxHash && { destinationTxHash: r.finalTxHash }),
+          failed: false,
+        })
+      }
+      onFailure={(r) =>
+        setReceipt({ sourceTxHash: sourceHash(r), failed: true })
+      }
+    />
+  );
+}
+```
+
+With `hasError` the receipt shows the failed stage, but on a bridge whose burn went through the Finish transfer button is still there, so the payer can complete it.
+
+<Warning>
+  Render `WhiskReceipt` inside a `WhiskProvider`. It reads the connected wallets
+  to finish transfers, and outside the provider (and outside any
+  `WagmiProvider`) wagmi throws on render.
+</Warning>
+
+For receipt pages that the payer opens from a link, see [receipts](/flows/receipts).

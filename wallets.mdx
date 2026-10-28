@@ -1,0 +1,297 @@
+---
+title: "Wallets"
+description: "Configure the evm(), solana(), stellar() and starknet() wallet factories, or bring your own wagmi config."
+---
+
+Each wallet ecosystem is turned on by a factory in `config.wallets`. Pass the factories for the ecosystems you accept and leave the others out:
+
+```ts whisk.ts
+import {
+  createWhiskConfig,
+  evm,
+  solana,
+  stellar,
+  starknet,
+} from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    evm({ chains: ["Base_Sepolia", "Arc_Testnet"] }),
+    solana(),
+    stellar(),
+    starknet(),
+  ],
+  chains: [
+    "Base_Sepolia",
+    "Arc_Testnet",
+    "Solana_Devnet",
+    "Stellar_Testnet",
+    "Starknet_Sepolia",
+  ],
+});
+```
+
+`WhiskProvider` mounts an ecosystem's wallet provider only when its factory is present, so an EVM-only app never starts the Solana, Stellar or Starknet code. Any single factory is enough: a config with only `solana()` is valid. `createWhiskConfig` throws a `ConfigError` when `wallets` is empty.
+
+The connect modal lists all four ecosystems and disables the ones without a factory.
+
+## Which wallet pays, and which one mints
+
+The wallet that pays is the one on the source chain's ecosystem. A bridge from Base Sepolia is paid by the EVM wallet; a bridge from Solana Devnet by the Solana wallet.
+
+The mint on the destination is submitted by Circle's Forwarding Service when the destination is an EVM chain that Circle forwards to and the source is an EVM chain or Solana. Every other route needs a wallet connected on the destination too, which signs the mint:
+
+- any bridge into Solana, Stellar or Starknet
+- any bridge out of Stellar or Starknet
+- bridges into the EVM chains Circle does not forward to (see [chains](/chains))
+
+The widget tells the payer which wallet to connect. With the engine directly, `quote` throws `RouteUnavailableError` with `reason: "destination_adapter_required"` until you pass a `destinationAdapter`. See [recipients](/concepts/recipients) and [errors](/concepts/errors).
+
+## EVM: `evm()`
+
+```ts
+import { evm } from "@usewhisk/react";
+
+export const wallet = evm({
+  chains: ["Base", "Arbitrum", "Arc"],
+  projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+  appName: "My Store",
+  rpcUrls: {
+    Base: "https://base-mainnet.example.com/YOUR_KEY",
+    Arbitrum: [
+      "https://arb-mainnet.example.com/YOUR_KEY",
+      "https://arb1.arbitrum.io/rpc",
+    ],
+  },
+});
+```
+
+`evm()` builds a wagmi config for you. Its options (`EvmFactoryOptions`):
+
+<ParamField path="chains" type="Chain[]">
+  EVM chains the wallet can switch to. Defaults to `["Arc_Testnet",
+  "Ethereum_Sepolia", "Base_Sepolia"]`. List every EVM chain in your
+  `config.chains`, or the widget cannot switch the wallet to it.
+</ParamField>
+
+<ParamField path="projectId" type="string">
+  Your WalletConnect Cloud project ID, free at cloud.walletconnect.com. Without
+  it the WalletConnect connector is left out; browser wallets and Coinbase
+  Wallet still work.
+</ParamField>
+
+<ParamField path="appName" type="string">
+  Shown in the WalletConnect and Coinbase Wallet pairing dialogs. Defaults to
+  `"Whisk"`.
+</ParamField>
+
+<ParamField path="rpcUrls" type="Partial<Record<Chain, string | string[]>>">
+  RPC endpoints for wagmi, per chain. An array becomes a viem `fallback`
+  transport ranked by latency. Chains without an entry use viem's default public
+  RPC. See [RPC endpoints](/rpc).
+</ParamField>
+
+Wallets offered: browser wallets through wagmi's `injected` connector (MetaMask, Rabby and other EIP-6963 wallets), Coinbase Wallet, and WalletConnect when `projectId` is set.
+
+<Warning>
+  `evm()` has wallet definitions for 36 of the 50 EVM chain ids. It has none for
+  `Cronos`, `Edge`, `Injective`, `Morph`, `Pharos`, `Plasma`, `X_Layer` and
+  their testnets, and drops them from `chains` without an error. The widget
+  cannot switch a wallet to those chains. To pay from one of them, bring your
+  own wagmi config that defines it (below).
+</Warning>
+
+### Bring your own wagmi config
+
+If your app already has a `WagmiProvider`, put `WhiskProvider` inside it. Whisk detects the outer provider and uses your wagmi config, connectors and transports instead of its own. An outer `QueryClientProvider` is reused the same way.
+
+```tsx App.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WagmiProvider, createConfig, http } from "wagmi";
+import { base, arbitrum } from "wagmi/chains";
+import { injected } from "wagmi/connectors";
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const wagmiConfig = createConfig({
+  chains: [base, arbitrum],
+  connectors: [injected()],
+  transports: { [base.id]: http(), [arbitrum.id]: http() },
+});
+
+const queryClient = new QueryClient();
+
+const whiskConfig = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base", "Arbitrum"],
+});
+
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <WagmiProvider config={wagmiConfig}>
+        <WhiskProvider config={whiskConfig}>
+          <WhiskSend />
+        </WhiskProvider>
+      </WagmiProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+Keep `evm()` in `wallets`: it turns on the EVM row in the connect modal. Its own wagmi config is not used when an outer `WagmiProvider` exists, so its options have no effect. Your wagmi config must include every EVM chain in `config.chains`.
+
+## Solana: `solana()`
+
+```ts
+import { solana } from "@usewhisk/react";
+
+export const devnet = solana();
+
+export const mainnet = solana({
+  network: "mainnet-beta",
+  endpoint: "https://solana-mainnet.example.com/YOUR_KEY",
+  autoConnect: true,
+});
+```
+
+<ParamField path="network" type={'"mainnet-beta" | "devnet" | "testnet"'}>
+  Defaults to `"devnet"`. Use `"devnet"` with `Solana_Devnet` and
+  `"mainnet-beta"` with `Solana`. CCTP has no Solana testnet cluster in the
+  registry.
+</ParamField>
+
+<ParamField path="endpoint" type="string">
+  The RPC the Solana connection uses. Defaults to the public endpoint for the
+  network (`https://api.devnet.solana.com` or
+  `https://api.mainnet-beta.solana.com`), which is rate limited.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Reconnect the last Solana wallet on page load. Defaults to `false`.
+</ParamField>
+
+Wallets offered: any wallet that registers through Wallet Standard, such as Phantom, Solflare and Backpack. Whisk bundles no per-wallet adapters.
+
+On a bridge into Solana, Whisk checks before the burn that the connected Solana wallet is on the destination's cluster and that the recipient already has a USDC token account. Without one, the route is refused with `RouteUnavailableError` (`reason: "recipient_account_missing"`), because the mint cannot create the account and the USDC would wait until someone did.
+
+## Stellar: `stellar()`
+
+```ts
+import { stellar } from "@usewhisk/react";
+
+export const testnet = stellar();
+
+export const pubnet = stellar({
+  network: "public",
+  rpcUrl: "https://soroban-mainnet.example.com",
+});
+```
+
+<ParamField path="network" type={'"public" | "testnet"'}>
+  Defaults to `"testnet"`. Use `"testnet"` with `Stellar_Testnet` and `"public"`
+  with `Stellar`.
+</ParamField>
+
+<ParamField path="rpcUrl" type="string">
+  The Soroban RPC used to simulate and submit the payer's transactions. Defaults
+  to `https://soroban-testnet.stellar.org` on testnet and
+  `https://mainnet.sorobanrpc.com` on public.
+</ParamField>
+
+<ParamField path="networkPassphrase" type="string">
+  Defaults to Stellar's standard passphrase for the network. Change it only for
+  a custom network.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Accepted, but `WhiskProvider` does not read it in 0.3.
+</ParamField>
+
+Wallets offered, through Stellar Wallets Kit: Freighter, Albedo, xBull, LOBSTR, Hana, Rabet and HOT Wallet.
+
+## Starknet: `starknet()`
+
+```ts
+import { starknet } from "@usewhisk/react";
+
+export const sepolia = starknet();
+
+export const mainnet = starknet({
+  network: "mainnet",
+  rpcUrl: "https://starknet-mainnet.example.com/YOUR_KEY",
+});
+```
+
+<ParamField path="network" type={'"mainnet" | "sepolia"'}>
+  Defaults to `"sepolia"`. Use `"sepolia"` with `Starknet_Sepolia` and
+  `"mainnet"` with `Starknet`.
+</ParamField>
+
+<ParamField path="rpcUrl" type="string">
+  Polled for transaction receipts. Defaults to the registry's public endpoint
+  (`https://starknet-sepolia-rpc.publicnode.com` or
+  `https://starknet-rpc.publicnode.com`).
+</ParamField>
+
+<ParamField path="chainId" type="string">
+  The chain id felt compared with the wallet's. Defaults to `SN_SEPOLIA` or
+  `SN_MAIN`.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Accepted, but `WhiskProvider` does not read it in 0.3.
+</ParamField>
+
+Wallets offered, through get-starknet: installed Starknet wallets such as Argent X and Braavos. Wallets in get-starknet's discovery list that are not installed are shown with a link to install them.
+
+## Match the factory network to your chains
+
+The Solana, Stellar and Starknet factories each serve one network, fixed when the provider mounts. On a bridge into Solana, Stellar or Starknet, the destination wallet's cluster, network or chain id is checked before the burn. `stellar()` with no options is on testnet, so a config whose chains include `Stellar` (mainnet) needs `stellar({ network: "public" })`.
+
+<Warning>
+  If the factory is on the wrong network for the destination, a bridge into
+  Solana, Stellar or Starknet fails with `WrongChainError` before anything is
+  signed, so the payer cannot complete it at all. Configure the factory for the
+  network of the chains you list, and test each route on testnet first.
+</Warning>
+
+On a bridge into Stellar, the destination wallet also reads the recipient's USDC trustline through Soroban RPC before the burn, and a `G` or `M` recipient without an authorized trustline with room for the amount is refused. A quote into Starknet reads the recipient's account over `createWhiskConfig({ rpcUrls })` for that chain and then the registry's defaults, not over the `starknet()` factory's `rpcUrl`. See [recipients](/concepts/recipients).
+
+## Reading the connected wallets
+
+Each ecosystem has a hook that returns its connected wallet as an adapter, or `null`. `useAdapterFor()` returns a function that picks the adapter for a chain.
+
+```tsx Wallets.tsx
+import {
+  useAdapterFor,
+  useEvmAdapter,
+  useSolanaAdapter,
+  useStarknetAdapter,
+  useStellarAdapter,
+} from "@usewhisk/react";
+
+export function ConnectedWallets() {
+  const evm = useEvmAdapter();
+  const solana = useSolanaAdapter();
+  const stellar = useStellarAdapter();
+  const starknet = useStarknetAdapter();
+  const adapterFor = useAdapterFor();
+  const payer = adapterFor("Base_Sepolia");
+  return (
+    <ul>
+      <li>EVM: {evm?.address ?? "not connected"}</li>
+      <li>Solana: {solana?.address ?? "not connected"}</li>
+      <li>Stellar: {stellar?.address ?? "not connected"}</li>
+      <li>Starknet: {starknet?.address ?? "not connected"}</li>
+      <li>Pays on Base Sepolia: {payer?.address ?? "nobody yet"}</li>
+    </ul>
+  );
+}
+```
+
+See [wallet adapters](/hooks/wallet-adapters) for passing them to the engine, and [ConnectModal](/widget/connect-modal) to open the wallet picker outside the widget.

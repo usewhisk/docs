@@ -1,0 +1,181 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "willow",
+  "name": "Whisk",
+  "description": "Stablecoin payments SDK. Send and bridge USDC over Circle CCTP V2 across EVM chains, Solana, Stellar and Starknet.",
+  "colors": {
+    "primary": "#2b3cff",
+    "light": "#2b3cff",
+    "dark": "#2b3cff"
+  },
+  "background": {
+    "color": {
+      "light": "#fbfaf7",
+      "dark": "#fbfaf7"
+    }
+  },
+  "appearance": {
+    "default": "light",
+    "strict": true
+  },
+  "fonts": {
+    "family": "Geist"
+  },
+  "logo": {
+    "light": "/logo/whisk.png",
+    "dark": "/logo/whisk.png",
+    "href": "https://usewhisk.xyz"
+  },
+  "favicon": "/favicon.png",
+  "navbar": {
+    "links": [
+      {
+        "label": "npm",
+        "href": "https://www.npmjs.com/org/usewhisk"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/usewhisk/whisk"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/usewhisk"
+    }
+  },
+  "contextual": {
+    "options": ["copy", "view", "chatgpt", "claude"]
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Docs",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "quickstart",
+              "installation",
+              "wallets",
+              "chains",
+              "rpc"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/amounts-and-units",
+              "concepts/quotes-and-fees",
+              "concepts/recovery",
+              "concepts/recipients",
+              "concepts/errors",
+              "concepts/fund-safety"
+            ]
+          },
+          {
+            "group": "Widget",
+            "pages": [
+              "widget/whisk-provider",
+              "widget/whisk-send",
+              "widget/whisk-receipt",
+              "widget/resume-list",
+              "widget/connect-modal",
+              "widget/primitives"
+            ]
+          },
+          {
+            "group": "Theming",
+            "pages": [
+              "theming/overview",
+              "theming/tokens",
+              "theming/tailwind",
+              "theming/fonts"
+            ]
+          },
+          {
+            "group": "Hooks",
+            "pages": [
+              "hooks/use-whisk",
+              "hooks/use-receipt",
+              "hooks/use-refund",
+              "hooks/wallet-adapters",
+              "hooks/use-whisk-engine"
+            ]
+          },
+          {
+            "group": "Headless",
+            "pages": [
+              "headless/core-engine",
+              "headless/react-headless",
+              "headless/server",
+              "headless/vue"
+            ]
+          },
+          {
+            "group": "Payment flows",
+            "pages": [
+              "flows/checkout",
+              "flows/receipts",
+              "flows/refunds",
+              "flows/metadata"
+            ]
+          },
+          {
+            "group": "Recipes",
+            "pages": [
+              "recipes/donate-button",
+              "recipes/ecommerce-checkout",
+              "recipes/invoice-link",
+              "recipes/payroll-batch",
+              "recipes/themed-saas"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "@usewhisk/react",
+            "pages": [
+              "reference/react/config",
+              "reference/react/components",
+              "reference/react/hooks"
+            ]
+          },
+          {
+            "group": "@usewhisk/core",
+            "pages": [
+              "reference/core/create-whisk",
+              "reference/core/engine",
+              "reference/core/types",
+              "reference/core/errors"
+            ]
+          },
+          {
+            "group": "@usewhisk/cctp",
+            "pages": [
+              "reference/cctp/overview",
+              "reference/cctp/chains",
+              "reference/cctp/builders",
+              "reference/cctp/iris",
+              "reference/cctp/fees"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Migration",
+        "groups": [
+          {
+            "group": "Upgrade guides",
+            "pages": ["migration/0-2-to-0-3", "migration/0-1-to-0-2"]
+          }
+        ]
+      }
+    ]
+  }
+}

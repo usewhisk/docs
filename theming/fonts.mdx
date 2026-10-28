@@ -1,0 +1,99 @@
+---
+title: Fonts
+description: The widget's default font stacks, the optional fonts.css that loads them, and how to use your own fonts.
+---
+
+The widget ships no font files by default. It names Inter, Familjen Grotesk and Geist Mono in its font stacks and uses them if your page already loads them; otherwise it falls back to system fonts. To load them, import the optional stylesheet next to the main one:
+
+```ts main.tsx
+import "@usewhisk/react/styles.css";
+import "@usewhisk/react/fonts.css";
+```
+
+## Default stacks
+
+From `@usewhisk/react/styles.css`:
+
+| Variable               | Stack                                                                                               | Used for                                            |
+| ---------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `--whisk-font`         | `"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`                     | All widget text.                                    |
+| `--whisk-font-display` | `"Familjen Grotesk", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif` | Not read by any 0.3 component.                      |
+| `--whisk-font-mono`    | `"JetBrains Mono", "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace`                    | Addresses, transaction hashes, the recipient field. |
+
+`JetBrains Mono` comes first in the mono stack, so a page that already loads it gets JetBrains Mono, not Geist Mono.
+
+## `fonts.css`
+
+`@usewhisk/react/fonts.css` declares `@font-face` rules for the three families, served from jsDelivr from Fontsource's variable-font packages, pinned to version 5.3.0:
+
+| Family           | Package                                       | Weights    | Styles         |
+| ---------------- | --------------------------------------------- | ---------- | -------------- |
+| Inter            | `@fontsource-variable/inter@5.3.0`            | 100 to 900 | normal, italic |
+| Familjen Grotesk | `@fontsource-variable/familjen-grotesk@5.3.0` | 400 to 700 | normal         |
+| Geist Mono       | `@fontsource-variable/geist-mono@5.3.0`       | 100 to 900 | normal         |
+
+Each face covers one Unicode range (Latin, Latin Extended, Cyrillic, Greek, Vietnamese, depending on the family), so the browser downloads only the files for the scripts on the page. Every face uses `font-display: swap`, so text shows in a fallback font while the file loads.
+
+It is opt-in because a widget that loads fonts on its own makes every host page send requests to a CDN. Skip it when:
+
+- your app already loads these fonts, or uses its own (see below),
+- your Content Security Policy does not allow `cdn.jsdelivr.net` in `font-src`,
+- you would rather self-host the files.
+
+If a font fails to load, the stack falls back to the next entry and the widget still renders.
+
+## Your own fonts
+
+Load your font the way your app already does, then point the variables at it. In a stylesheet loaded after `styles.css`:
+
+```css app.css
+[data-whisk] {
+  --whisk-font: "Source Sans 3", system-ui, sans-serif;
+  --whisk-font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+```
+
+Or through the `theme` prop, with the `font`, `fontDisplay` and `fontMono` tokens:
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider
+      config={config}
+      theme={{
+        preset: "light",
+        tokens: {
+          font: '"Source Sans 3", system-ui, sans-serif',
+          fontDisplay: '"Fraunces", Georgia, serif',
+          fontMono: '"JetBrains Mono", ui-monospace, monospace',
+        },
+      }}
+    >
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+Tokens are written inline, so they win over any stylesheet. A stylesheet rule only works with the `"light"`, `"dark"` and `"auto"` themes; see [how a theme is applied](/theming/overview#how-a-theme-is-applied).
+
+<Tip>
+  With `next/font`, pass the font's CSS variable: for example
+  `--whisk-font: var(--font-inter), system-ui, sans-serif;` in a stylesheet,
+  where `--font-inter` is the `variable` you gave `next/font`. The variable must
+  be defined on an element above the widget, such as `<html>` or `<body>`.
+</Tip>
+
+The [Tailwind preset](/theming/tailwind) exposes `--whisk-font` and `--whisk-font-mono` as `font-whisk` and `font-whisk-mono`.

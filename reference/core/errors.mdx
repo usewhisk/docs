@@ -1,0 +1,238 @@
+---
+title: "Errors"
+description: "Every Whisk error class, code, category and route-unavailable reason: when each happens, whether funds moved, and what the app should do."
+---
+
+Every error the engine raises is a `WhiskError` with a stable `code`. They are exported from `@usewhisk/core`, from `@usewhisk/core/errors`, and re-exported by `@usewhisk/react`. For the handling patterns, see [Errors](/concepts/errors).
+
+```ts
+import { WhiskError, type SendResult } from "@usewhisk/core";
+
+declare function send(): Promise<SendResult>;
+
+try {
+  const result = await send();
+  if (result.kind === "failure") {
+    const { code, step, retryable, message } = result.error;
+    console.log(code, step, retryable, message);
+  }
+} catch (err) {
+  if (err instanceof WhiskError) console.log(err.code, err.category, err.cause);
+  else throw err;
+}
+```
+
+Errors reach you two ways. **Thrown** errors come from checks that run before anything is signed (the exceptions are listed under [resume](/reference/core/engine#resume)). **Returned** errors sit on `SendFailure.error`, after a wallet was asked to sign; the failed step in `SendFailure.steps` tells you whether the burn landed. See [Fund safety](/concepts/fund-safety).
+
+## WhiskError
+
+```ts
+class WhiskError extends Error {
+  readonly code: WhiskErrorCode;
+  readonly retryable: boolean;
+  readonly step?: StepName;
+  readonly category?: WhiskErrorCategory;
+  readonly cause?: unknown;
+  constructor(opts: WhiskErrorOptions);
+}
+```
+
+<ResponseField name="code" type="WhiskErrorCode">
+  Switch on this. Stable across releases.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable, safe to show. Wallet and RPC noise is cut down to the first
+  line; the original stays on `cause`.
+</ResponseField>
+
+<ResponseField name="retryable" type="boolean">
+  `true` when repeating the same action can succeed (the payer can sign again,
+  the network can recover, Circle can catch up). Defaults to `false`.
+</ResponseField>
+
+<ResponseField name="step" type="StepName">
+  The step that failed, when the error knows it. On returned failures, the
+  failed entry in `steps` is the reliable source.
+</ResponseField>
+
+<ResponseField name="category" type="WhiskErrorCategory">
+  Finer classification of wallet and chain failures. See
+  [Categories](#categories).
+</ResponseField>
+
+<ResponseField name="cause" type="unknown">
+  The original error from the wallet, RPC or Iris.
+</ResponseField>
+
+`WhiskErrorOptions` is `{ code; message; retryable?; step?; category?; cause? }`, for creating your own `WhiskError` in an adapter.
+
+`instanceof` works for every subclass, including after transpilation.
+
+## Codes
+
+"Before burn" means no USDC has left the payer's wallet for the bridge. "After burn" means USDC is in flight and the transfer can be finished with `resume` or `resumeFromTx`. On EVM sources with a `feePolicy`, the merchant fee goes in one atomic batch with the burn or after the burn has landed, never before it, so a failure before the burn never costs the payer the fee. A fee the payer rejects after the burn is reported on `customFee`, not as a failure.
+
+| Code                   | Class                      | Retryable      | When it happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Funds                                                                                        | What the app should do                                                                                                                                                                                                                                          |
+| ---------------------- | -------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NO_ADAPTER`           | `NoAdapterError`           | no             | Not raised by the engine or the React package in 0.3. Exported for your own adapters and UI.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Before burn.                                                                                 | Ask the payer to connect a wallet.                                                                                                                                                                                                                              |
+| `WRONG_CHAIN`          | `WrongChainError`          | yes            | A Solana, Stellar or Starknet destination wallet is on a different network than the destination chain: checked before the burn on routes into Solana, Stellar and Starknet, and again when the wallet signs a mint. Custom EVM adapters throw it from `switchChain` when the wallet refuses to switch.                                                                                                                                                                                                                                                             | Before burn on the destination pre-check; after burn when minting.                           | Ask the payer to switch the wallet to `err.expectedChain`, then send again (before burn) or resume (after burn).                                                                                                                                                |
+| `INSUFFICIENT_BALANCE` | `InsufficientBalanceError` | no             | Thrown by `send` when an EVM payer's USDC is below `quote.subunits.amountIn` plus, on Arc, the gas reserve. Solana, Stellar and Starknet balances are not checked; the wallet refuses instead.                                                                                                                                                                                                                                                                                                                                                                     | Before burn. Nothing signed.                                                                 | Show `err.required` and `err.available` (decimal USDC). Offer `maxSendable`.                                                                                                                                                                                    |
+| `INVALID_ADDRESS`      | `InvalidAddressError`      | no             | Thrown by `quote` when the recipient does not fit the destination's address format, including a Starknet address below `2**160` (an Ethereum address pasted by mistake) or past Starknet's address range. Returned by same-chain sends that catch a bad address before the wallet is asked.                                                                                                                                                                                                                                                                        | Before burn. Nothing signed.                                                                 | Ask for a correct address. `err.input` holds what was given.                                                                                                                                                                                                    |
+| `RESOLVER_FAILED`      | `ResolverError`            | yes            | Thrown by `resolve` when a resolver fails, such as an ENS RPC error.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | No transfer yet.                                                                             | Retry, or ask for a raw address. `err.resolverName` names the resolver.                                                                                                                                                                                         |
+| `BRIDGE_STEP_FAILED`   | `BridgeStepError`          | yes by default | From `resume` and `resumeFromTx`: Circle has not attested the burn yet, its relayer has not minted yet, a re-attestation is not ready, or Iris has not seen the burn hash.                                                                                                                                                                                                                                                                                                                                                                                         | After burn.                                                                                  | Wait, then resume again. The record stays in the store.                                                                                                                                                                                                         |
+| `USER_REJECTED`        | `UserRejectedError`        | yes            | The payer declined a wallet prompt. Category `user_rejected`. Message: "You cancelled the transaction in your wallet."                                                                                                                                                                                                                                                                                                                                                                                                                                             | Depends on the step: at `approve`, `burn` or `transfer`, before burn; at `mint`, after burn. | Let the payer try again. At `mint`, resume when they are ready.                                                                                                                                                                                                 |
+| `NETWORK_ERROR`        | `NetworkError`             | yes            | A transient network failure in a wallet or RPC call (connection reset, timeout, `fetch failed`, HTTP 5xx). Also returned at step `mint` with category `failed_offchain` when Circle's forwarder reports `FAILED` on a Solana to EVM bridge.                                                                                                                                                                                                                                                                                                                        | Check the failed step.                                                                       | Retry. After burn, resume: for a failed forward, with a `destinationAdapter` to mint.                                                                                                                                                                           |
+| `WALLET_CAPABILITY`    | `WalletCapabilityError`    | no             | In 0.3 the engine returns it with category `polling_timeout` when Circle has not attested within the poll window (step `fetchAttestation`) or the forwarder has not minted in time (step `mint`). An adapter throws it with `atomic_unsupported` from `sendCalls({ atomic: true })` when it cannot land the batch all or nothing; `useEvmAdapter` does so on Arc and for wallets that refuse an atomic batch. The other categories come only from adapters that report EIP-5792 batch problems.                                                                    | `polling_timeout`: after burn. Others: before burn.                                          | `polling_timeout`: the transfer is still in flight; resume later even though `retryable` is `false`. `atomic_unsupported` from a fee batch: nothing to do, the engine sends the calls one by one instead. Others: fall back to sequential calls in the adapter. |
+| `ONCHAIN_REVERT`       | `OnchainRevertError`       | no             | A transaction reverted. At step `approve`: the approve, or an atomic batch carrying the merchant fee. At `burn`: the burn. At `mint`: the mint (resume re-attests an expired attestation once before giving up). A merchant fee transfer that reverts after the burn is reported on `customFee.error` and does not fail the transfer.                                                                                                                                                                                                                              | `approve`, `burn`: before burn, no USDC bridged. `mint`: after burn.                         | Before burn, check the payer's balance and try again. After burn, resume; if it keeps reverting, see [Recovery](/concepts/recovery).                                                                                                                            |
+| `CONFIG_ERROR`         | `ConfigError`              | no             | Bad setup or input: empty `chains`, invalid amount or metadata, a `feePolicy.recipient` that is not an EVM address, an adapter of the wrong ecosystem, a missing `destinationAdapter` on a route that needs one, `resolve` finding nothing, invalid refund input, a hook used outside `<WhiskProvider>` or without a wallet. Returned before the burn on a bridge to a Stellar `G` or `M` recipient when the destination `StellarAdapter` has no `getTrustline`. From `resume`: a record with no burn hash, or an attested message that does not match the record. | Before burn, except the `resume` cases, which are after burn.                                | Fix the code or the input. For a record with no burn hash, use `resumeFromTx` with the hash from the wallet.                                                                                                                                                    |
+| `NETWORK_MISMATCH`     | `NetworkMismatchError`     | no             | `quote` or `send` with one mainnet and one testnet chain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Before burn. Nothing signed.                                                                 | Pick both chains on the same network. `err.source` and `err.destination` hold the chain labels.                                                                                                                                                                 |
+| `ROUTE_UNAVAILABLE`    | `RouteUnavailableError`    | no             | The route cannot run as asked. See [reasons](#route-unavailable-reasons).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Depends on the reason.                                                                       | Read `err.reason` and `err.ecosystem`.                                                                                                                                                                                                                          |
+| `QUOTE_EXPIRED`        | `QuoteExpiredError`        | yes            | Thrown by `send` when the quote is past `expiresAt` (60 seconds after issue), or Circle's signed upfront fee expired twice.                                                                                                                                                                                                                                                                                                                                                                                                                                        | Before burn. Nothing signed.                                                                 | Quote again and have the payer confirm the new numbers. `err.quote` is the expired quote.                                                                                                                                                                       |
+| `QUOTE_CHANGED`        | `QuoteChangedError`        | yes            | Thrown by `send` when Circle's fees rose past the confirmed `maxFee`, or the route's speed or mint method changed.                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Before burn. Nothing signed.                                                                 | Show `err.quote` (fresh) next to `err.previous`, and send `err.quote` once the payer confirms.                                                                                                                                                                  |
+| `UNKNOWN`              | `WhiskError`               | no             | `toWhiskError` could not classify the error. Also used for "no route" messages from routing APIs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Check the failed step.                                                                       | Show the message; log `cause`.                                                                                                                                                                                                                                  |
+
+## Classes
+
+Each subclass sets its `code`, `name` and `retryable`, and some carry extra fields.
+
+| Class                      | Constructor                                                             | Extra fields                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `NoAdapterError`           | `(message?, cause?)`                                                    |                                                                                                                          |
+| `WrongChainError`          | `(expectedChain: string, cause?)`                                       | `expectedChain`: chain id, cluster, Stellar network or Starknet chain id felt the wallet should be on.                   |
+| `InsufficientBalanceError` | `(required: string, available: string, token: string, cause?)`          | `required`, `available` (decimal strings), `token`.                                                                      |
+| `InvalidAddressError`      | `(input: string, cause?, message?)`                                     | `input`. `message` defaults to saying the input is not a recognised address.                                             |
+| `ResolverError`            | `(resolverName: string, message: string, cause?)`                       | `resolverName`.                                                                                                          |
+| `BridgeStepError`          | `(step: StepName, message: string, opts?: { retryable?; cause? })`      | `step` is always set.                                                                                                    |
+| `UserRejectedError`        | `(message?, cause?)`                                                    | `category` is `"user_rejected"`.                                                                                         |
+| `NetworkError`             | `(message: string, cause?, category?)`                                  |                                                                                                                          |
+| `WalletCapabilityError`    | `(category, message: string, cause?)`                                   | `category` is one of `atomic_unsupported`, `batch_too_large`, `duplicate_batch_id`, `unknown_bundle`, `polling_timeout`. |
+| `OnchainRevertError`       | `(category, message: string, cause?, step?)`                            | `category` is one of `reverted_onchain`, `partial_reverted`, `chain_revert`.                                             |
+| `ConfigError`              | `(message: string, cause?)`                                             |                                                                                                                          |
+| `NetworkMismatchError`     | `(source: string, destination: string)`                                 | `source`, `destination` (chain labels).                                                                                  |
+| `RouteUnavailableError`    | `(reason: RouteUnavailableReason, message: string, ecosystem?: string)` | `reason`, `ecosystem`.                                                                                                   |
+| `QuoteExpiredError`        | `(quote: Quote)`                                                        | `quote`: the expired quote.                                                                                              |
+| `QuoteChangedError`        | `(previous: Quote, quote: Quote)`                                       | `previous`: what the payer confirmed. `quote`: the fresh quote.                                                          |
+
+```ts explain.ts
+import {
+  InsufficientBalanceError,
+  NetworkMismatchError,
+  QuoteChangedError,
+  QuoteExpiredError,
+  RouteUnavailableError,
+  WrongChainError,
+  InvalidAddressError,
+  ResolverError,
+  toWhiskError,
+  type WhiskErrorCode,
+} from "@usewhisk/core/errors";
+
+export function explain(err: unknown): string {
+  if (err instanceof QuoteChangedError) {
+    return `New price: you pay ${err.quote.amountIn} (was ${err.previous.amountIn}).`;
+  }
+  if (err instanceof QuoteExpiredError)
+    return "The quote expired. Get a new one.";
+  if (err instanceof InsufficientBalanceError) {
+    return `Need ${err.required} ${err.token}, have ${err.available}.`;
+  }
+  if (err instanceof RouteUnavailableError) {
+    return err.reason === "destination_adapter_required"
+      ? `Connect a ${err.ecosystem ?? ""} wallet.`
+      : err.message;
+  }
+  if (err instanceof NetworkMismatchError)
+    return `${err.source} and ${err.destination} differ.`;
+  if (err instanceof WrongChainError) return `Switch to ${err.expectedChain}.`;
+  if (err instanceof InvalidAddressError) return `Bad address: ${err.input}`;
+  if (err instanceof ResolverError) return `${err.resolverName} failed.`;
+  const code: WhiskErrorCode = toWhiskError(err).code;
+  return code;
+}
+```
+
+## Route unavailable reasons
+
+`RouteUnavailableReason` is the `reason` on a `RouteUnavailableError`. `err.ecosystem` names the wallet ecosystem involved, when there is one.
+
+| Reason                         | When it happens                                                                                                                                                                                                                                                                                                              | Funds                                               | What the app should do                                                                                                                                             |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `same_chain`                   | `planRoute` called with the same chain as source and destination. `quote` and `send` treat that as a same-chain send instead, so the engine never raises it.                                                                                                                                                                 | Before burn.                                        | Use a same-chain send.                                                                                                                                             |
+| `source_adapter_required`      | Thrown by `quote` or `send` on a bridge when `adapter` is not a wallet of the source chain's ecosystem.                                                                                                                                                                                                                      | Before burn. Nothing signed.                        | Connect a wallet of `err.ecosystem`.                                                                                                                               |
+| `destination_adapter_required` | Thrown by `quote` or `send` when Circle will not forward the mint and no wallet of the destination ecosystem was passed. Thrown by `resume` and `resumeFromTx` when the mint needs a `destinationAdapter` that is missing or of the wrong ecosystem.                                                                         | `quote`, `send`: before burn. `resume`: after burn. | Connect a wallet of `err.ecosystem` and call again (or resume).                                                                                                    |
+| `recipient_account_missing`    | Returned as a failure on a bridge into Solana when the recipient has no USDC token account, which Solana's `receive_message` cannot create. Also returned on a bridge into Stellar when a `G` or `M` recipient has no USDC trustline, one the issuer has not authorized, or one without room under its limit for the amount. | Before burn. The message says "Nothing was sent."   | Ask the recipient to create their USDC account on Solana (for example by receiving any USDC), or to add or raise their USDC trustline on Stellar, then send again. |
+| `recipient_not_deployed`       | Thrown by `quote` into Starknet when no account is deployed at the recipient address. Skipped for the connected Starknet wallet's own address and when the quote passes `allowUndeployedRecipient: true`.                                                                                                                    | Before burn. Nothing signed.                        | Ask the payer whether the address is their own new wallet. If they confirm, quote again with `allowUndeployedRecipient: true`.                                     |
+
+## Categories
+
+`WhiskErrorCategory` uses the same values as Circle App Kit's `BridgeStepErrorCategory`. When `toWhiskError` gets a category, the category decides the class.
+
+| Category             | Class                   | Produced in 0.3 by                                                                                                                                                                                  |
+| -------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `user_rejected`      | `UserRejectedError`     | Any adapter error whose message says the user rejected or denied the request.                                                                                                                       |
+| `atomic_unsupported` | `WalletCapabilityError` | Adapters, from `sendCalls({ atomic: true })`. `useEvmAdapter` throws it for calls that carry a gas price (Arc) and for a wallet that refuses the batch. The engine then sends the calls one by one. |
+| `batch_too_large`    | `WalletCapabilityError` | Adapters only.                                                                                                                                                                                      |
+| `duplicate_batch_id` | `WalletCapabilityError` | Adapters only.                                                                                                                                                                                      |
+| `unknown_bundle`     | `WalletCapabilityError` | Adapters only.                                                                                                                                                                                      |
+| `polling_timeout`    | `WalletCapabilityError` | The engine, after a burn, when Circle's attestation or forwarder misses the poll window.                                                                                                            |
+| `failed_offchain`    | `NetworkError`          | The engine, when the forwarder reports `FAILED` on a Solana to EVM bridge.                                                                                                                          |
+| `reverted_onchain`   | `OnchainRevertError`    | The engine and the React EVM adapter, for a reverted transaction.                                                                                                                                   |
+| `partial_reverted`   | `OnchainRevertError`    | Adapters only.                                                                                                                                                                                      |
+| `chain_revert`       | `OnchainRevertError`    | Adapters only.                                                                                                                                                                                      |
+| `unknown`            | decided by the message  | Passing it is the same as passing no category.                                                                                                                                                      |
+
+## Helpers
+
+```ts
+import { WhiskError, cleanErrorMessage, toWhiskError } from "@usewhisk/core";
+
+const fromWallet = toWhiskError(new Error("User rejected the request."));
+const custom = new WhiskError({
+  code: "UNKNOWN",
+  message: cleanErrorMessage("execution reverted\nRequest Arguments: ..."),
+  retryable: false,
+});
+const timedOut = toWhiskError(
+  new Error("still pending"),
+  "Timed out",
+  "polling_timeout",
+);
+console.log(fromWallet.code, custom.message, timedOut.code);
+```
+
+### toWhiskError
+
+```ts
+function toWhiskError(
+  err: unknown,
+  fallbackMessage?: string,
+  category?: WhiskErrorCategory,
+): WhiskError;
+```
+
+Turns anything thrown into a `WhiskError`, keeping the original on `cause`. Use it in adapters and around calls to `@usewhisk/cctp`.
+
+1. A `WhiskError` is returned unchanged.
+2. A `category` other than `unknown` picks the class from the table above.
+3. Otherwise the message is matched: "user rejected", "user denied" or "rejected by user" gives `UserRejectedError`; "no route" or "route not found" gives an `UNKNOWN` error asking to try another amount; `ECONNRESET`, `ETIMEDOUT`, `ENOTFOUND`, `ECONNREFUSED`, `EAI_AGAIN`, "socket hang up", "network error", "fetch failed" or "status code 5xx" gives `NetworkError`.
+4. Anything else is `UNKNOWN`, not retryable.
+
+`fallbackMessage` (default `"Unknown error"`) is used when `err` is neither an `Error` nor a string.
+
+### cleanErrorMessage
+
+```ts
+function cleanErrorMessage(message: string): string;
+```
+
+Keeps the first line of a viem or App Kit error, drops any inline "Request Arguments:" dump and App Kit's "Unknown blockchain error on chain:" prefix. Returns the trimmed original when nothing is left.
+
+## Errors from @usewhisk/cctp
+
+Iris and RPC calls inside `quote`, `send`, `balance`, `resume` and the Iris helpers can throw errors from `@usewhisk/cctp`. These are not `WhiskError`s: they extend `CctpError` with their own `code`, such as `IrisNetworkError` (`iris_network`), `IrisRateLimitedError` (`iris_rate_limited`, with `retryAt`), `IrisHttpError` (`iris_http`), `ProtocolError` (`rpc_unavailable`, `fee_unavailable`, `no_route`) and `UnknownChainError` (`invalid_chain`). They are thrown before any signature in `quote` and `send`. Wrap them with `toWhiskError` if you want one shape. See [CCTP overview](/reference/cctp/overview).
+
+<Note>
+  `@usewhisk/cctp` also has a class named `InvalidAddressError`. It is not the
+  `@usewhisk/core` one: `instanceof` against the core class does not match it.
+</Note>

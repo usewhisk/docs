@@ -1,0 +1,182 @@
+---
+title: Payroll batch
+description: An admin tool that walks a list of payees and pays each one through the same WhiskSend, one signature per payee.
+---
+
+The `payroll-batch` example is a Vite and React tool for a fictional studio. An
+operator reviews six payees, excludes any, then dispatches the run: the widget
+loads the next payee's amount and chain, the operator signs, and `onSuccess`
+moves on. The last step shows a run summary.
+
+The core is a hook that walks the list and records what happened to each
+payee. This version tracks paid and skipped payees separately:
+
+```ts use-batch.ts
+import { useCallback, useMemo, useState } from "react";
+import { formatUsdcAmount, parseUsdcAmount, type Chain } from "@usewhisk/react";
+
+export type Payee = {
+  id: string;
+  name: string;
+  address: string;
+  amount: string;
+  chain: Chain;
+};
+
+export type Outcome =
+  { status: "paid"; txHash?: string } | { status: "skipped" };
+
+export function useBatch(payees: Payee[]) {
+  const [index, setIndex] = useState(0);
+  const [outcomes, setOutcomes] = useState<Record<string, Outcome>>({});
+  const current = payees[index];
+
+  const record = useCallback(
+    (outcome: Outcome) => {
+      if (!current) return;
+      setOutcomes((prev) => ({ ...prev, [current.id]: outcome }));
+      setIndex((i) => i + 1);
+    },
+    [current],
+  );
+
+  const markPaid = useCallback(
+    (txHash?: string) => record({ status: "paid", ...(txHash && { txHash }) }),
+    [record],
+  );
+  const skip = useCallback(() => record({ status: "skipped" }), [record]);
+
+  const totals = useMemo(() => {
+    let paid = 0n;
+    let skipped = 0n;
+    for (const payee of payees) {
+      const outcome = outcomes[payee.id];
+      if (outcome?.status === "paid") paid += parseUsdcAmount(payee.amount);
+      if (outcome?.status === "skipped")
+        skipped += parseUsdcAmount(payee.amount);
+    }
+    return { paid: formatUsdcAmount(paid), skipped: formatUsdcAmount(skipped) };
+  }, [payees, outcomes]);
+
+  return {
+    current,
+    done: index >= payees.length,
+    outcomes,
+    totals,
+    markPaid,
+    skip,
+  };
+}
+```
+
+<Warning>
+  The example as shipped calls the same `advance` function for **Skip** and for
+  a settled payment, so a skipped payee is counted, summed and listed as paid in
+  the run summary
+  ([usewhisk/whisk#159](https://github.com/usewhisk/whisk/issues/159)). The
+  example will be fixed. Until then, use the pattern above: one outcome per
+  payee, totals in `bigint` subunits, and the tx hash kept with each payment.
+</Warning>
+
+The widget for the payee in front of the operator:
+
+```tsx active-payee.tsx
+import { WhiskSend } from "@usewhisk/react";
+import type { Payee } from "./use-batch";
+
+const SOURCE_CHAIN = "Arc_Testnet";
+
+export function ActivePayee({
+  payee,
+  onPaid,
+  onSkip,
+}: {
+  payee: Payee;
+  onPaid: (txHash?: string) => void;
+  onSkip: () => void;
+}) {
+  return (
+    <div>
+      <WhiskSend
+        key={payee.id}
+        tabs={[payee.chain === SOURCE_CHAIN ? "send" : "bridge"]}
+        amount={payee.amount}
+        recipient={payee.address}
+        sourceChain={SOURCE_CHAIN}
+        destinationChain={payee.chain}
+        onSuccess={({ finalTxHash }) => onPaid(finalTxHash)}
+      />
+      <button onClick={onSkip}>Skip {payee.name}</button>
+    </div>
+  );
+}
+```
+
+Wire them together with `const batch = useBatch(payees)` and render
+`<ActivePayee payee={batch.current} onPaid={batch.markPaid} onSkip={batch.skip} />`
+while `batch.current` is set.
+
+## How it works
+
+- **One signature per payee.** Each payment is its own quote and wallet prompt
+  (two when a bridge needs a USDC approval first). The treasury wallet signs
+  every one.
+- **Bridged from Arc.** Payments start on Arc Testnet, where gas is paid in
+  USDC, and bridge to each payee's chain. A payee on Arc gets a same-chain
+  transfer. The `tabs` line above picks the right tab; the example leaves both
+  tabs visible.
+- **Treasury pays the fees.** The config sets `feeBearer: "sender"`, so each
+  bridge burns a little more than the salary and the payee receives at least
+  the full amount.
+- **A fresh widget per payee.** `key={payee.id}` remounts `<WhiskSend>`, so no
+  quote, result or error carries over from the previous payee.
+
+The provider (`src/providers.tsx`) lists Arbitrum Sepolia, Arc Testnet, Base
+Sepolia and Optimism Sepolia, with `evm()` only.
+
+## Run it locally
+
+From a clone of [usewhisk/whisk](https://github.com/usewhisk/whisk), with Node
+20 or later and pnpm:
+
+```bash
+pnpm install
+pnpm build
+cp examples/payroll-batch/.env.example examples/payroll-batch/.env.local
+pnpm --filter @usewhisk/example-payroll-batch dev
+```
+
+Open http://localhost:3013. The `dev` script sets the port; the README's 5174
+is out of date.
+
+| Variable                        | Required | Effect                                                                                         |
+| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `VITE_WALLETCONNECT_PROJECT_ID` | No       | Adds the WalletConnect connector. Without it, injected wallets and Coinbase Wallet still work. |
+
+<Note>
+  The example's payee addresses are shortened display strings, so every payment
+  in the demo goes to one placeholder address (`STUDIO_TREASURY`). Its amounts
+  are large (thousands of USDC); exclude payees or edit `src/data/payees.ts` to
+  fit your testnet balance.
+</Note>
+
+## For production
+
+- **Pay real addresses.** Pass each payee's full address as `recipient`, as in
+  the snippet above, not the placeholder.
+- **Keep amounts as strings and sum in `bigint`.** The example stores salaries
+  as JavaScript numbers. Use decimal strings and `parseUsdcAmount` so totals
+  never go through float math.
+- **Record every outcome.** Save each payee's status and tx hash as it happens,
+  on your server, so a reload or a closed tab does not lose the run. Skipped
+  payees stay unpaid in your records.
+- **Handle failures.** Add an `onFailure` that stops the run. If the burn step
+  succeeded, the USDC is in flight; finish it from the
+  [`<ResumeList>`](/widget/resume-list) before paying anyone twice. See
+  [recovery](/concepts/recovery).
+- **Consider a server.** For a long list, signing in a browser one payee at a
+  time is slow. The core engine runs the same sends from a server wallet; see
+  [server usage](/headless/server) and the `node-headless` example's
+  `payroll.ts`.
+- **Use mainnet chain ids** (`Arc`, `Base`, `Optimism`, `Arbitrum`) for the
+  treasury's source chain and every payee's chain.

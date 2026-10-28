@@ -1,0 +1,328 @@
+---
+title: Vue
+description: Wire @usewhisk/core into a Vue 3 app with a composable and an injected browser wallet.
+---
+
+Whisk has no Vue package. The engine in `@usewhisk/core` is framework-agnostic,
+so a Vue app creates it once and wraps it in a composable that holds the flow
+state in refs.
+
+```ts composables/useWhisk.ts
+import { ref, shallowRef } from "vue";
+import {
+  createPublicClient,
+  createWalletClient,
+  custom,
+  http,
+  type EIP1193Provider,
+} from "viem";
+import {
+  createWhisk,
+  toWhiskError,
+  tryChainByEvmChainId,
+  type Chain,
+  type EvmAdapter,
+  type Quote,
+  type Step,
+  type WhiskError,
+} from "@usewhisk/core";
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+function browserAdapter(
+  provider: EIP1193Provider,
+  address: `0x${string}`,
+): EvmAdapter {
+  const wallet = createWalletClient({
+    account: address,
+    transport: custom(provider),
+  });
+  // Injected wallets are slow to report receipts, so poll the chain's public RPC.
+  const publicClientFor = async () => {
+    const chain = tryChainByEvmChainId(await wallet.getChainId());
+    return createPublicClient({
+      transport: chain ? http(chain.defaultRpcUrls[0]) : custom(provider),
+    });
+  };
+
+  return {
+    kind: "evm",
+    address,
+    getChainId: () => wallet.getChainId(),
+    async switchChain(id) {
+      try {
+        await wallet.switchChain({ id });
+      } catch (cause) {
+        throw toWhiskError(cause, "Failed to switch chain.");
+      }
+    },
+    async sendCalls(calls, options) {
+      const publicClient = await publicClientFor();
+      const hashes: `0x${string}`[] = [];
+      for (const [index, call] of calls.entries()) {
+        try {
+          const hash = await wallet.sendTransaction({
+            chain: null,
+            to: call.to,
+            data: call.data,
+            value: call.value,
+            ...(call.maxFeePerGas !== undefined && {
+              maxFeePerGas: call.maxFeePerGas,
+            }),
+            ...(call.maxPriorityFeePerGas !== undefined && {
+              maxPriorityFeePerGas: call.maxPriorityFeePerGas,
+            }),
+          });
+          hashes.push(hash);
+          options?.onSubmitted?.(hash, index);
+          await publicClient.waitForTransactionReceipt({
+            hash,
+            confirmations: 2,
+          });
+        } catch (cause) {
+          throw toWhiskError(cause, "Failed to submit transaction.");
+        }
+      }
+      return { hashes };
+    },
+    async waitForReceipt(hash) {
+      const receipt = await (
+        await publicClientFor()
+      ).waitForTransactionReceipt({ hash });
+      return {
+        status: receipt.status === "success" ? "success" : "reverted",
+        blockNumber: receipt.blockNumber,
+      };
+    },
+  };
+}
+
+type SendState =
+  | { kind: "idle" }
+  | { kind: "quoting" }
+  | { kind: "review"; quote: Quote }
+  | { kind: "sending"; quote: Quote; steps: Step[] }
+  | { kind: "done"; txHash: string | undefined; steps: Step[] }
+  | { kind: "failed"; error: WhiskError };
+
+export function useWhisk() {
+  const adapter = shallowRef<EvmAdapter | null>(null);
+  const state = ref<SendState>({ kind: "idle" });
+
+  async function connect() {
+    const provider = (window as { ethereum?: EIP1193Provider }).ethereum;
+    if (!provider) {
+      state.value = {
+        kind: "failed",
+        error: toWhiskError(new Error("No browser wallet found.")),
+      };
+      return;
+    }
+    try {
+      const [address] = await provider.request({
+        method: "eth_requestAccounts",
+      });
+      if (address) adapter.value = browserAdapter(provider, address);
+    } catch (err) {
+      state.value = {
+        kind: "failed",
+        error: toWhiskError(err, "Connect failed."),
+      };
+    }
+  }
+
+  async function quote(
+    to: string,
+    amount: string,
+    sourceChain: Chain,
+    destinationChain: Chain,
+  ) {
+    if (!adapter.value) return;
+    state.value = { kind: "quoting" };
+    try {
+      const recipient = await engine.resolve(to, destinationChain);
+      const q = await engine.quote({
+        sourceChain,
+        destinationChain,
+        recipient,
+        amount,
+        adapter: adapter.value,
+      });
+      state.value = { kind: "review", quote: q };
+    } catch (err) {
+      state.value = {
+        kind: "failed",
+        error: toWhiskError(err, "Quote failed."),
+      };
+    }
+  }
+
+  async function send() {
+    if (state.value.kind !== "review" || !adapter.value) return;
+    const q = state.value.quote;
+    const steps: Step[] = [];
+    state.value = { kind: "sending", quote: q, steps };
+    try {
+      const result = await engine.send(
+        { quote: q, adapter: adapter.value },
+        {
+          onStep(step) {
+            const i = steps.findIndex((s) => s.name === step.name);
+            if (i === -1) steps.push(step);
+            else steps[i] = step;
+            state.value = { kind: "sending", quote: q, steps: [...steps] };
+          },
+        },
+      );
+      state.value =
+        result.kind === "success"
+          ? { kind: "done", txHash: result.finalTxHash, steps: result.steps }
+          : { kind: "failed", error: result.error };
+    } catch (err) {
+      state.value = {
+        kind: "failed",
+        error: toWhiskError(err, "Send failed."),
+      };
+    }
+  }
+
+  function reset() {
+    state.value = { kind: "idle" };
+  }
+
+  return { adapter, state, connect, quote, send, reset };
+}
+```
+
+This follows
+[`examples/vue-headless`](https://github.com/usewhisk/whisk/tree/main/examples/vue-headless)
+in the Whisk repo, which has the full page with a form, review screen and step
+list.
+
+## Install
+
+```bash
+pnpm add @usewhisk/core viem vue buffer
+```
+
+## Vite setup
+
+`@usewhisk/core` brings in `@usewhisk/cctp`, which loads `@solana/web3.js`
+and `@stellar/stellar-sdk`. Both read Node's `Buffer` when they load, even if
+your app only uses EVM chains, and Vite does not provide it. Set it before
+anything else imports Whisk:
+
+```ts main.ts
+import { Buffer } from "buffer";
+if (typeof globalThis.Buffer === "undefined") {
+  globalThis.Buffer = Buffer;
+}
+
+import { createApp } from "vue";
+import App from "./App.vue";
+
+createApp(App).mount("#app");
+```
+
+The example's `vite.config.ts` also aliases `buffer` to the npm package,
+stubs Node's `crypto` with an empty module (nothing calls it in the browser),
+and defines `global` as `globalThis` and `process.env` as `{}`.
+
+## How the composable works
+
+- **One engine per app.** `createWhisk` runs at module level, so every
+  component shares the engine and its in-flight store. Add chains to `chains`
+  to widen it; mainnet or testnet follows from the chain ids.
+- **The adapter wraps `window.ethereum`.** viem's `custom` transport signs
+  through the injected wallet. `switchChain` asks the wallet to switch, since
+  the engine moves the wallet to the source chain before sending. Receipts are
+  polled over the chain's public RPC from Whisk's registry, because injected
+  providers are slow to report them.
+- **Errors become `WhiskError`s.** Adapter failures go through `toWhiskError`
+  so the engine and your UI see typed errors, such as `UserRejectedError` when
+  the payer cancels in the wallet.
+- **The state is a tagged union.** `idle`, `quoting`, `review`, `sending`,
+  `done` and `failed`, so the template renders one branch per `kind`.
+  `@usewhisk/core` also exports `reduce` and `initialState` if you would rather
+  reuse Whisk's own state machine; see
+  [useWhisk](/hooks/use-whisk#the-state-machine).
+- **`adapter` is a `shallowRef`.** Vue would otherwise wrap the adapter object
+  in a reactive proxy.
+
+`send` throws, and the composable shows `failed`, when the engine refuses
+before signing: an expired quote (60 seconds), changed fees, or a balance too
+low. After the burn, a failure means USDC is in flight; the engine keeps the
+transfer in its in-flight store so it can be finished with `engine.resume`.
+The default store is memory, so pass
+`inflightStore: createStorageInflightStore(window.localStorage)` to
+`createWhisk` to keep transfers across a reload. See
+[the core engine](/headless/core-engine#in-flight-transfers).
+
+## Using it in a component
+
+```vue App.vue
+<script setup lang="ts">
+import { ref } from "vue";
+import type { Chain } from "@usewhisk/core";
+import { useWhisk } from "./composables/useWhisk";
+
+const { adapter, state, connect, quote, send, reset } = useWhisk();
+
+const to = ref("");
+const amount = ref("1.00");
+const sourceChain = ref<Chain>("Base_Sepolia");
+const destinationChain = ref<Chain>("Arc_Testnet");
+
+function getQuote() {
+  return quote(
+    to.value,
+    amount.value,
+    sourceChain.value,
+    destinationChain.value,
+  );
+}
+</script>
+
+<template>
+  <button v-if="!adapter" @click="connect">Connect wallet</button>
+
+  <form
+    v-else-if="state.kind === 'idle' || state.kind === 'failed'"
+    @submit.prevent="getQuote"
+  >
+    <p v-if="state.kind === 'failed'" role="alert">{{ state.error.message }}</p>
+    <input v-model="to" placeholder="0x..." />
+    <input v-model="amount" inputmode="decimal" />
+    <button type="submit">Get quote</button>
+  </form>
+
+  <p v-else-if="state.kind === 'quoting'">Getting a quote...</p>
+
+  <div v-else-if="state.kind === 'review'">
+    <p>You pay {{ state.quote.amountIn }} USDC</p>
+    <p>Recipient gets at least {{ state.quote.amountOut }} USDC</p>
+    <button @click="reset">Back</button>
+    <button @click="send">Confirm</button>
+  </div>
+
+  <ol v-else-if="state.kind === 'sending'">
+    <li v-for="step in state.steps" :key="step.name">
+      {{ step.name }}: {{ step.state }}
+    </li>
+  </ol>
+
+  <div v-else-if="state.kind === 'done'">
+    <p>Delivered. Mint tx: {{ state.txHash ?? "not reported" }}</p>
+    <button @click="reset">Send another</button>
+  </div>
+</template>
+```
+
+## What you build yourself
+
+Compared with the React widget, a Vue app has no connect modal, theming or
+recipient chip. Resolution still works: `engine.resolve` accepts addresses on
+every ecosystem, and you can add a name resolver with the `resolver` option.
+The example is EVM only. For Solana, Stellar or Starknet, write a
+`SolanaAdapter`, `StellarAdapter` or `StarknetAdapter` in the same way; their
+shapes are in [wallet adapters](/hooks/wallet-adapters).

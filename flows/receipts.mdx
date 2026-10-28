@@ -1,0 +1,249 @@
+---
+title: Receipts
+description: Show where a transfer stands from its source-chain tx hash, in the widget, in your own UI, or on a server.
+---
+
+A receipt needs three things: the source chain, the source-chain tx hash, and
+the destination chain. `deriveReceiptView` turns those, plus Circle's latest
+attestation status, into a stage and a list of steps:
+
+```ts
+import { deriveReceiptView, RECEIPT_STAGE_LABELS } from "@usewhisk/core";
+
+const view = deriveReceiptView({
+  sourceChain: "Base_Sepolia",
+  sourceTxHash:
+    "0x8a3f5c0e2b7d4a91c6e0f3b2d5a8c7e1f0b9a6d3c2e5f8a1b4d7c0e3f6a9b2c5",
+  destinationChain: "Arc_Testnet",
+  irisStatus: "pending_confirmations",
+});
+
+console.log(view.stage);
+console.log(RECEIPT_STAGE_LABELS[view.stage]);
+console.log(view.sourceExplorerUrl);
+```
+
+That prints `awaiting_attestation`, `Confirming on source chain` and a Base
+Sepolia explorer link. `deriveReceiptView` does no I/O: you call it again with
+a fresher `irisStatus` to move the view forward. The React pieces below do the
+polling for you.
+
+## Build a receipt page
+
+A receipt link only has to carry the hash and the two chains. Build it from the
+`SendSuccess` you got at payment time. For a bridge the hash is on the `burn`
+step; for a same-chain send it is on the `transfer` step.
+
+```ts receipt-link.ts
+import type { Chain, SendSuccess } from "@usewhisk/react";
+
+export function receiptLink(
+  result: SendSuccess,
+  sourceChain: Chain,
+  destinationChain: Chain,
+): string {
+  const burn = result.steps.find(
+    (step) => step.name === "burn" || step.name === "transfer",
+  );
+  const url = new URL("/receipt", window.location.origin);
+  url.searchParams.set("tx", burn?.txHash ?? "");
+  url.searchParams.set("from", sourceChain);
+  url.searchParams.set("to", destinationChain);
+  return url.toString();
+}
+```
+
+The page reads the link back, checks the chain ids, and renders
+[`<WhiskReceipt>`](/widget/whisk-receipt):
+
+```tsx ReceiptPage.tsx
+import { WhiskReceipt, isChainId } from "@usewhisk/react";
+
+export function ReceiptPage() {
+  const params = new URLSearchParams(window.location.search);
+  const tx = params.get("tx");
+  const from = params.get("from") ?? "";
+  const to = params.get("to") ?? "";
+
+  if (!tx || !isChainId(from) || !isChainId(to)) {
+    return <p>This receipt link is incomplete.</p>;
+  }
+
+  return (
+    <WhiskReceipt
+      title="Payment receipt"
+      sourceChain={from}
+      sourceTxHash={tx}
+      destinationChain={to}
+    />
+  );
+}
+```
+
+Render it inside a [`<WhiskProvider>`](/widget/whisk-provider). For a
+cross-chain transfer that has not settled, `<WhiskReceipt>` shows a **Finish
+transfer** button. It calls `engine.resumeFromTx`, which waits for the
+attestation and mints, unless Circle's Forwarder minted or the destination
+already received the USDC. It never signs a second burn. If the mint needs a wallet on the destination chain, the visitor
+has to connect one first. See [recovery](/concepts/recovery).
+
+Link parameters are untrusted. `isChainId` rejects a chain Whisk does not
+know; a wrong hash only shows a receipt that never progresses. A receipt is
+for the payer's eyes. Do not use it to decide whether an order is paid; see
+[verify on your server](/flows/checkout#verify-on-your-server).
+
+## Stages
+
+| `ReceiptStage`         | When                                                                     | Label (`RECEIPT_STAGE_LABELS`) |
+| ---------------------- | ------------------------------------------------------------------------ | ------------------------------ |
+| `submitted`            | Cross-chain, Iris has not seen the burn yet (no status, or `not_found`). | Submitted                      |
+| `awaiting_attestation` | Iris reports `pending_confirmations`.                                    | Confirming on source chain     |
+| `attested`             | Iris reports `complete` and no destination tx hash was given.            | Minting on destination         |
+| `settled`              | A destination tx hash was given, or the transfer is on one chain.        | Settled                        |
+| `failed`               | The caller passed `hasError: true`.                                      | Failed                         |
+
+`RECEIPT_STAGE_HELP` holds a one-line English explanation for each stage.
+Both maps are plain records, so you can swap in your own copy or translations.
+
+Two limits follow from the fact that the view only knows what you pass it and
+what Iris says:
+
+- **A cross-chain transfer only reaches `settled` when you pass
+  `destinationTxHash`.** Iris reporting `complete` means the attestation is
+  signed, not that the mint landed, so the view stops at `attested`. Polling
+  also stops there. If you have the mint hash (`finalTxHash` from the send
+  result), pass it.
+- **A same-chain transfer is `settled` as soon as you pass a hash.** Nothing is
+  read from the chain. Check the transaction yourself if the hash came from a
+  link.
+
+`failed` is never inferred. Pass `hasError` when you already hold a
+`SendFailure`.
+
+## ReceiptView
+
+<ResponseField name="stage" type="ReceiptStage">
+  One of the five stages above.
+</ResponseField>
+<ResponseField name="steps" type="Step[]">
+  A single `transfer` step for a same-chain send. Otherwise `burn`,
+  `fetchAttestation` and `mint`, each with a `state` of `pending`, `success`,
+  `error` or `noop`. The burn step carries the source hash and explorer link;
+  the mint step carries the destination ones when you passed a destination hash.
+</ResponseField>
+<ResponseField name="isCrossChain" type="boolean">
+  `sourceChain !== destinationChain`.
+</ResponseField>
+<ResponseField name="sourceExplorerUrl" type="string">
+  Explorer link for the source tx.
+</ResponseField>
+<ResponseField name="destinationExplorerUrl" type="string | undefined">
+  Explorer link for the destination tx, when you passed its hash.
+</ResponseField>
+
+The input type is `ReceiptInput`: `sourceChain`, `sourceTxHash`,
+`destinationChain`, and optional `destinationTxHash`, `irisStatus` and
+`hasError`.
+
+## Your own receipt UI
+
+[`useReceipt`](/hooks/use-receipt) polls Iris and returns the same view, so you
+can draw it however you like:
+
+```tsx TransferStatus.tsx
+import {
+  RECEIPT_STAGE_HELP,
+  RECEIPT_STAGE_LABELS,
+  useReceipt,
+  type Chain,
+} from "@usewhisk/react";
+
+export function TransferStatus(props: {
+  sourceChain: Chain;
+  destinationChain: Chain;
+  burnTxHash: string;
+  mintTxHash?: string;
+}) {
+  const { view, isLoading, error } = useReceipt({
+    sourceChain: props.sourceChain,
+    sourceTxHash: props.burnTxHash,
+    destinationChain: props.destinationChain,
+    destinationTxHash: props.mintTxHash,
+    pollIntervalMs: 5000,
+  });
+
+  if (isLoading) return <p>Looking up the transfer...</p>;
+  if (error) return <p role="alert">Could not reach Circle: {error.message}</p>;
+  if (!view) return null;
+
+  return (
+    <section>
+      <h2>{RECEIPT_STAGE_LABELS[view.stage]}</h2>
+      <p>{RECEIPT_STAGE_HELP[view.stage]}</p>
+      <ol>
+        {view.steps.map((step) => (
+          <li key={step.name}>
+            {step.name}: {step.state}
+            {step.explorerUrl && <a href={step.explorerUrl}> view</a>}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+```
+
+`useReceipt` polls every 3 seconds by default and gives up after 10 minutes
+(`pollIntervalMs`, `pollTimeoutMs`). It does not poll a same-chain transfer, a
+transfer with a `destinationTxHash`, or one with `hasError`.
+
+## On a server
+
+Without React, fetch the Iris status yourself and feed it through the same
+function. This is useful for a worker that records settlement with no browser
+open.
+
+```ts receipt-stage.ts
+import {
+  deriveReceiptView,
+  fetchAttestationOnce,
+  type Chain,
+  type ReceiptStage,
+} from "@usewhisk/core";
+
+export async function receiptStage(
+  sourceChain: Chain,
+  destinationChain: Chain,
+  burnTxHash: string,
+): Promise<ReceiptStage> {
+  const iris = await fetchAttestationOnce(sourceChain, burnTxHash);
+  return deriveReceiptView({
+    sourceChain,
+    sourceTxHash: burnTxHash,
+    destinationChain,
+    irisStatus: iris.status,
+  }).stage;
+}
+```
+
+The Iris host (mainnet or sandbox) is picked from the source chain's network.
+`pollAttestation` does the loop for you, with `timeout`, `pollingInterval` and
+an `onUpdate` callback.
+
+## Explorer links
+
+`explorerTxUrl` builds a link for any supported chain, including the cluster
+query Solana's explorer needs on devnet:
+
+```ts
+import { explorerTxUrl } from "@usewhisk/core";
+
+const url = explorerTxUrl(
+  "Arc_Testnet",
+  "0x8a3f5c0e2b7d4a91c6e0f3b2d5a8c7e1f0b9a6d3c2e5f8a1b4d7c0e3f6a9b2c5",
+);
+console.log(url);
+```
+
+Use it instead of a hard-coded explorer host, so a link for a Base payment does
+not point at Arc's explorer. `explorerAddressUrl` does the same for addresses.

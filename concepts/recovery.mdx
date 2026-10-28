@@ -1,0 +1,227 @@
+---
+title: Recovery
+description: How a bridge that stopped between the burn and the mint gets finished, after a closed tab, a slow attestation or a failed mint.
+---
+
+Once a bridge's burn is signed, the USDC has left the payer's wallet and only a mint on the destination delivers it. Whisk keeps a record of every bridge from the moment it is signed, so a transfer that stops part way can be finished later without burning again.
+
+```ts
+import {
+  createStorageInflightStore,
+  createWhisk,
+  type WhiskAdapter,
+} from "@usewhisk/core";
+
+declare const destinationAdapter: WhiskAdapter | undefined;
+
+const engine = createWhisk({
+  chains: ["Base_Sepolia", "Arc_Testnet", "Solana_Devnet"],
+  inflightStore: createStorageInflightStore(window.localStorage),
+});
+
+for (const record of await engine.inflight()) {
+  if (record.step === "minted") {
+    await engine.dismiss(record.id);
+    continue;
+  }
+  const result = await engine.resume(
+    record,
+    destinationAdapter ? { destinationAdapter } : {},
+  );
+  if (result.kind === "success") await engine.dismiss(record.id);
+  else console.warn(record.id, result.error.message);
+}
+```
+
+## In-flight records
+
+`send` writes an `InflightRecord` to the engine's `inflightStore` for every bridge. Same-chain sends have no record; they settle in one transaction.
+
+| `step`     | When it is written                                                                |
+| ---------- | --------------------------------------------------------------------------------- |
+| `signing`  | Before the wallet is asked for anything.                                          |
+| `burned`   | The moment the wallet returns the burn hash, before any wait for a receipt.       |
+| `attested` | When Circle's attestation arrives.                                                |
+| `minted`   | When the recipient has the USDC. `mintTxHash` is set when the mint hash is known. |
+
+A record also holds the network, the source and destination chains, who mints (`"forwarder"` or `"adapter"`), the speed, the amount burned (a 6-decimal subunit string) and the recipient. Its `id` is the id of the quote it was sent from.
+
+If `send` ends before a burn hash was recorded (the payer rejected the wallet prompt, or a check failed), the record is removed. A record with a burn hash is never removed by Whisk on its own. It stays until you call `engine.dismiss(id)`, even after it reaches `minted`, so the payer can see the transfer finish.
+
+`engine.inflight()` lists the records, oldest first.
+
+## Stores
+
+`InflightStore` is a three-method interface: `put`, `list` and `remove`. Whisk ships three:
+
+- **`createMemoryInflightStore()`**, the `createWhisk` default. Records last as long as the engine, so a reload loses them.
+- **`createStorageInflightStore(storage)`** keeps each record as JSON under `whisk:inflight:<id>` in any Web Storage object, such as `localStorage`. It ignores entries under that prefix that are not valid version 2 records.
+- **`createBrowserInflightStore()`**, from `@usewhisk/react`, uses `localStorage` when the page can write to it and falls back to memory when it cannot (Safari private browsing, server rendering). `<WhiskProvider>` uses it unless you pass `inflightStore` in the config.
+
+Write your own store to keep records on a server, for example keyed by the payer's account, so a transfer can be finished from another device.
+
+<Warning>
+  With the memory store, a closed tab loses the record. The USDC is still safe
+  on the attested message, but the payer needs the burn hash from their wallet
+  history to finish the transfer with `resumeFromTx`. Pass a persistent store
+  wherever you can.
+</Warning>
+
+## Resume and dismiss
+
+`engine.resume(record, options?, listeners?)` finishes a transfer from its record:
+
+1. On an EVM source it reads the burn's status. A reverted burn moved no USDC, so the record is removed and `resume` returns a failure saying so.
+2. It polls Iris until the burn is attested, then checks the attested message against the record: the destination domain and the burned amount must match, or it returns a failure instead of minting.
+3. If Circle forwards the mint, it waits for the forwarder. If the forwarder reports `FAILED`, it falls back to a wallet mint.
+4. Before a wallet mint it checks whether the destination already received the message (on EVM, whether the message nonce is used). If so, it marks the record `minted` without signing anything.
+5. It mints with `options.destinationAdapter`. An attestation that expired is re-attested by Circle once, and the mint tried again.
+
+`resume` returns a `SendResult` like `send`. A failure with `retryable: true` (Circle has not attested yet, or the forwarder has not minted yet) means "try again later", not "something is wrong".
+
+A wallet mint on an EVM destination without an EVM `destinationAdapter` throws `RouteUnavailableError` with `reason: "destination_adapter_required"`. Connect a wallet on the destination chain and resume again; any EVM wallet can submit the mint, and the USDC still goes to the recorded recipient.
+
+`engine.dismiss(id)` removes a record. Call it once the payer has seen the transfer finish, or chooses to drop it. Dismissing does not touch any funds; a burned transfer can still be finished later with `resumeFromTx`.
+
+## ResumeList
+
+`<ResumeList>` renders every record in the engine's store with Resume and Dismiss buttons. It picks the destination wallet for the record's chain from the connected wallets. `<WhiskSend>` renders one above the form, so a payer who reloads mid-transfer sees it on return. Render it on its own anywhere inside `<WhiskProvider>`:
+
+```tsx
+import { ResumeList } from "@usewhisk/react";
+
+export function PendingTransfers() {
+  return <ResumeList />;
+}
+```
+
+It reads the store once, when it mounts, and renders nothing when there are no records. A transfer that fails after the burn in the same session appears in the list after the component remounts.
+
+<Note>
+  In 0.3, `<ResumeList>` shows the amount of a transfer from Stellar at one tenth of its value: it formats the 6-decimal record with Stellar's 7 decimals. The record, the resume and the mint use the correct amount.
+</Note>
+
+See [ResumeList](/widget/resume-list) for details.
+
+## When the tab closes mid-transfer
+
+| Closed while...                                 | What happened to the USDC                   | How to finish                                             |
+| ----------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- |
+| the wallet prompt was open, before signing      | Nothing moved.                              | Nothing to finish. The `signing` record can be dismissed. |
+| the wallet was submitting the burn              | It may have burned; the record has no hash. | Find the burn hash in the wallet and call `resumeFromTx`. |
+| waiting for the burn receipt or the attestation | Burned.                                     | `resume` the `burned` record.                             |
+| waiting for the forwarder or the wallet mint    | Burned and attested.                        | `resume` the record.                                      |
+
+A `signing` record passed to `resume` returns a failure that says no burn was recorded and points at `resumeFromTx`. No merchant fee was taken for it: the fee is only sent with the burn or after it.
+
+A record for a transfer with a `feePolicy` fee keeps the fee's amount, status and hashes as `customFee`. `resume` reports it on the result's `customFee` and never asks the payer for the fee again, even when it was not paid.
+
+## resumeFromTx
+
+`engine.resumeFromTx({ sourceChain, txHash, destinationAdapter? })` finishes a transfer from the burn hash alone, such as a hash from a receipt link or the payer's wallet history. If the store already has a record for that hash it uses it; otherwise it builds one from what Iris decoded from the burn (destination, amount, recipient, speed, whether it was forwarded), saves it, and resumes.
+
+```ts
+import { createWhisk, type EvmAdapter } from "@usewhisk/core";
+
+declare const arcWallet: EvmAdapter;
+
+const engine = createWhisk({ chains: ["Stellar", "Arc"] });
+
+const result = await engine.resumeFromTx({
+  sourceChain: "Stellar",
+  txHash: "9f2c...burn-hash-from-the-wallet",
+  destinationAdapter: arcWallet,
+});
+```
+
+Until Iris has seen the burn, `resumeFromTx` throws a retryable `BridgeStepError`. Call it again after a few seconds.
+
+## When the forwarder fails
+
+Circle's forwarder spends its fee on destination gas. If gas rises past that fee, or the relayer fails for another reason, Iris reports the forward as `FAILED` or leaves it pending. The attested message is still valid, and anyone can submit it, because Whisk leaves `destinationCaller` empty on every burn into an EVM chain.
+
+- `send` falls back to a wallet mint when Iris reports `FAILED`. With no `destinationAdapter` on an EVM to EVM route, the source wallet switches chain and signs it.
+- If the forwarder is still pending when `send` stops polling, `send` returns a failure on the `mint` step with category `polling_timeout`. The record stays `attested`; `resume` waits for the forwarder again, and mints with the wallet if it has failed by then.
+
+## Manual mint without the engine
+
+For a support tool, or a page that only has a burn hash, `@usewhisk/core` exports the pieces on their own:
+
+- `fetchAttestationOnce(sourceChain, burnTxHash, options?)` returns the Iris status (`"not_found"`, `"pending_confirmations"` or `"complete"`), with `message` and `attestation` once complete;
+- `pollAttestation(sourceChain, burnTxHash, options?)` polls every 3 seconds for up to 10 minutes by default;
+- `buildReceiveMessageCall(destinationChain, message, attestation)` returns a `receiveMessage` call for an EVM destination, or `null` for any other ecosystem.
+
+```ts
+import { buildReceiveMessageCall, fetchAttestationOnce } from "@usewhisk/core";
+import type { Account, Chain, Hex, WalletClient } from "viem";
+
+declare const walletClient: WalletClient;
+declare const account: Account;
+declare const arc: Chain;
+declare const burnTxHash: string;
+
+const attested = await fetchAttestationOnce("Base", burnTxHash, {
+  baseUrl: "https://iris-proxy.example.com",
+});
+
+if (
+  attested.status === "complete" &&
+  attested.message &&
+  attested.attestation
+) {
+  const call = buildReceiveMessageCall(
+    "Arc",
+    attested.message,
+    attested.attestation,
+  );
+  if (call) {
+    const [message, attestation] = call.args;
+    await walletClient.writeContract({
+      account,
+      chain: arc,
+      address: call.address as Hex,
+      abi: call.abi,
+      functionName: call.functionName,
+      args: [message as Hex, attestation as Hex],
+    });
+  }
+}
+```
+
+`ReceiveMessageCall` types `address` and `args` as plain strings, so viem needs the casts to `Hex` shown above. These helpers do not re-attest an expired attestation or check whether the message was already received; `engine.resume` and `resumeFromTx` do both.
+
+## Pointing recovery at another Iris host
+
+`fetchAttestationOnce` and `pollAttestation` take `baseUrl`, which replaces the Iris host chosen from the source chain's network. Use it to route recovery through your own proxy. `IRIS_MAINNET_URL` and `IRIS_SANDBOX_URL` are exported, and `getIrisBaseUrl(chain)` returns the default for a chain.
+
+The engine has no `baseUrl` option. To send its Iris requests (including those made by `resume` and `resumeFromTx`) through a proxy, pass a `fetch` to `createWhisk` that rewrites the URL:
+
+```ts
+import { createWhisk } from "@usewhisk/core";
+
+const engine = createWhisk({
+  chains: ["Base", "Arc"],
+  fetch: (input, init) => {
+    const url = new URL(
+      input instanceof Request ? input.url : input.toString(),
+    );
+    if (url.hostname === "iris-api.circle.com") {
+      url.hostname = "iris-proxy.example.com";
+    }
+    return fetch(url, init);
+  },
+});
+```
+
+`WhiskClientConfig` in `@usewhisk/react` has no `fetch` option in 0.3, so this needs the core engine.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Fund safety" href="/concepts/fund-safety">
+    What Whisk guarantees about the payer's money, and where the gaps are.
+  </Card>
+  <Card title="Receipts" href="/flows/receipts">
+    Showing a transfer's status from its burn hash.
+  </Card>
+</CardGroup>

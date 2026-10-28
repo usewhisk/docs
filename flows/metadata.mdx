@@ -1,0 +1,141 @@
+---
+title: Metadata
+description: Tag a send with your own correlation keys, and know exactly where those keys go.
+---
+
+Metadata is a flat object of your own keys, such as an order id or a campaign
+code, that you pass to `send` and get back on the result:
+
+```ts
+import { createWhisk, type EvmAdapter, type Quote } from "@usewhisk/core";
+
+declare const adapter: EvmAdapter;
+declare const quote: Quote;
+
+const engine = createWhisk({
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  defaultMetadata: { source: "web", env: "staging" },
+});
+
+const result = await engine.send({
+  quote,
+  adapter,
+  metadata: { orderId: "ord_123", env: "prod" },
+});
+
+console.log(result.metadata);
+```
+
+That logs `{ source: "web", env: "prod", orderId: "ord_123" }`. Per-call keys
+win over `defaultMetadata` when both set the same key.
+
+## Where metadata goes
+
+Metadata never leaves the engine that was given it. In 0.3:
+
+| Place                                       | Has metadata?                                                                     |
+| ------------------------------------------- | --------------------------------------------------------------------------------- |
+| `SendResult.metadata` (success and failure) | Yes                                                                               |
+| `RefundResult.metadata`                     | Yes, plus the refund keys                                                         |
+| The burn or transfer transaction            | No                                                                                |
+| CCTP `hookData`                             | No. Whisk only writes Circle's Forwarder marker and, into Stellar, the recipient. |
+| Circle's Iris API                           | No                                                                                |
+| The in-flight record (`InflightRecord`)     | No                                                                                |
+| The result of `resume` or `resumeFromTx`    | No                                                                                |
+| Any Whisk server                            | No. Whisk 0.3 runs no server and calls none of yours.                             |
+
+So metadata answers one question: which of your orders does this result
+belong to? It does not let anyone else, including your server, tie a
+transaction on chain back to an order. Your code has to send the order id and
+the tx hashes to your server itself, ideally from `onBurnSubmitted` as well as
+on success. See [checkout](/flows/checkout).
+
+Two consequences worth planning for:
+
+- If the payer reloads mid-bridge and finishes from the
+  [`<ResumeList>`](/widget/resume-list), the resumed result has no metadata.
+  Keep your own map from order id to burn hash.
+- If `send` throws instead of returning a failure (an expired quote, a fee
+  rise, too little balance), there is no result and so no metadata on it.
+
+<Warning>
+  Metadata passes through the payer's browser and anyone with dev tools can read
+  or change it. Do not put emails, names, addresses or anything sensitive in it,
+  and do not trust it on the way back. It is a label, not a proof.
+</Warning>
+
+## Rules
+
+`validateMetadata` enforces them, and `send` runs it before it checks the quote
+or asks for a signature. `createWhisk` runs it on `defaultMetadata` when the
+engine is created. Any break throws `ConfigError`.
+
+- A plain object. Not `null`, not an array.
+- Keys are non-empty strings and do not start with `__`
+  (`METADATA_RESERVED_PREFIX`). That prefix is kept for Whisk's own keys, such
+  as the refund links.
+- Values are `string`, `number` or `boolean`. No nested objects or arrays.
+- Numbers are finite: no `NaN` or `Infinity`.
+- The JSON-serialized object is at most 1024 bytes (`METADATA_MAX_BYTES`),
+  counted as UTF-8, so a 4-byte emoji costs 4.
+
+An empty object passes.
+
+```ts check-metadata.ts
+import {
+  ConfigError,
+  validateMetadata,
+  type WhiskMetadata,
+} from "@usewhisk/react";
+
+export function checkMetadata(
+  input: unknown,
+): { ok: true; metadata: WhiskMetadata } | { ok: false; reason: string } {
+  try {
+    validateMetadata(input);
+    return { ok: true, metadata: input };
+  } catch (err) {
+    if (err instanceof ConfigError) return { ok: false, reason: err.message };
+    throw err;
+  }
+}
+```
+
+`validateMetadata` is a TypeScript assertion function: after it returns,
+`input` is typed `WhiskMetadata`.
+
+## Defaults and merging
+
+`WhiskConfig.defaultMetadata` is merged into every `send` and `refund` of a
+core engine. The merge is `mergeMetadata(defaults, perCall)`: a shallow spread
+where per-call keys win, returning `undefined` when both are empty. When
+neither is set, `result.metadata` is absent rather than `{}`.
+
+<Note>
+  The React config from `createWhiskConfig` has no `defaultMetadata` option in
+  0.3, so `<WhiskProvider>` cannot set one
+  ([usewhisk/whisk#156](https://github.com/usewhisk/whisk/issues/156)). Merge
+  your defaults yourself before each call.
+</Note>
+
+```ts order-metadata.ts
+import { mergeMetadata, type WhiskMetadata } from "@usewhisk/react";
+
+const APP_METADATA: WhiskMetadata = { app: "atelier", release: "2026.10" };
+
+export function orderMetadata(orderId: string) {
+  return mergeMetadata(APP_METADATA, { orderId });
+}
+```
+
+## Where you can pass it
+
+| API                                         | Metadata                                  |
+| ------------------------------------------- | ----------------------------------------- |
+| `engine.send({ quote, adapter, metadata })` | Yes                                       |
+| `useWhisk().send({ quote, metadata })`      | Yes                                       |
+| `engine.refund` and `useRefund`             | Yes, as `metadata` on the refund input    |
+| `<WhiskSend>`                               | No prop. Use `useWhisk` to tag a payment. |
+| `engine.resume`, `engine.resumeFromTx`      | No                                        |
+
+The type is `WhiskMetadata = Record<string, string | number | boolean>`.

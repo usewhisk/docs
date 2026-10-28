@@ -1,0 +1,86 @@
+---
+title: "Chains"
+description: "How Whisk names chains, how the network follows the chain, and which chains you can use."
+---
+
+A chain in Whisk is a string id such as `"Base"`, `"Base_Sepolia"` or `"Arc_Testnet"`. The type is `Chain`, and every helper that takes a chain is checked against the registry at compile time:
+
+```ts
+import { CHAINS, getChain, isChainId, type Chain } from "@usewhisk/react";
+
+const base = getChain("Base_Sepolia");
+console.log(base.label, base.ecosystem, base.network, base.cctpDomain);
+
+const testnets: Chain[] = CHAINS.filter((c) => c.network === "testnet").map(
+  (c) => c.id,
+);
+
+function parseChain(input: string): Chain {
+  if (!isChainId(input)) throw new Error(`Unknown chain: ${input}`);
+  return input;
+}
+```
+
+The registry lives in `@usewhisk/cctp` and is re-exported by `@usewhisk/core` and `@usewhisk/react`. It holds 56 chains: 25 EVM mainnets and their 25 testnets, plus Solana, Stellar and Starknet on mainnet and testnet. Each entry carries the chain's CCTP domain, USDC address, CCTP contracts, default RPCs, explorer and capabilities. The ids are Circle's names for each chain, so a testnet id names its testnet: `Ethereum_Sepolia`, `Avalanche_Fuji`, `Polygon_Amoy_Testnet`, `Solana_Devnet`.
+
+## Common chain ids
+
+| Ecosystem | Mainnet       | Testnet                | Fast source | Circle forwards the mint |
+| --------- | ------------- | ---------------------- | ----------- | ------------------------ |
+| EVM       | `Ethereum`    | `Ethereum_Sepolia`     | yes         | yes                      |
+| EVM       | `Base`        | `Base_Sepolia`         | yes         | yes                      |
+| EVM       | `Arbitrum`    | `Arbitrum_Sepolia`     | yes         | yes                      |
+| EVM       | `Optimism`    | `Optimism_Sepolia`     | yes         | yes                      |
+| EVM       | `Polygon`     | `Polygon_Amoy_Testnet` | no          | yes                      |
+| EVM       | `Avalanche`   | `Avalanche_Fuji`       | no          | yes                      |
+| EVM       | `Linea`       | `Linea_Sepolia`        | yes         | yes                      |
+| EVM       | `Unichain`    | `Unichain_Sepolia`     | yes         | yes                      |
+| EVM       | `World_Chain` | `World_Chain_Sepolia`  | yes         | yes                      |
+| EVM       | `Arc`         | `Arc_Testnet`          | no          | yes                      |
+| Solana    | `Solana`      | `Solana_Devnet`        | yes         | yes                      |
+| Stellar   | `Stellar`     | `Stellar_Testnet`      | no          | no                       |
+| Starknet  | `Starknet`    | `Starknet_Sepolia`     | yes         | no                       |
+
+"Fast source" means Circle offers Fast Transfer for burns from that chain. "Circle forwards the mint" means Circle's Forwarding Service can submit the mint on that chain. The full list, with domains and every capability, is in the [chain reference](/reference/cctp/chains).
+
+## Network comes from the chain
+
+Every chain id belongs to one network, `"mainnet"` or `"testnet"`, and a transfer runs on the network of its source chain. There is no `mode` setting. The same config can list mainnet and testnet chains together:
+
+```ts whisk.ts
+import { createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base", "Base_Sepolia", "Arc", "Arc_Testnet"] })],
+  chains: ["Base", "Base_Sepolia", "Arc", "Arc_Testnet"],
+});
+```
+
+`WhiskSend` then offers only destinations on the same network as the selected source chain. A route that mixes the two is refused by `quote` with `NetworkMismatchError` before anything is signed. Circle's attestation service is chosen the same way: Iris mainnet for mainnet chains, the Iris sandbox for testnets.
+
+## Ecosystems
+
+`getChain(id).ecosystem` is one of `"evm"`, `"solana"`, `"stellar"` or `"starknet"` (the `ChainKind` type). The ecosystem decides which wallet factory a chain needs: put a chain in `config.chains` only if the matching factory is in `config.wallets`. See [wallets](/wallets).
+
+USDC has 6 decimals on every chain Whisk supports, with one exception: raw Stellar trustline balances use 7. Amounts you pass to Whisk are decimal strings such as `"10.50"` whatever the chain. See [amounts and units](/concepts/amounts-and-units).
+
+## Fast and Standard
+
+CCTP V2 has two transfer speeds, and the source chain decides which one Whisk uses:
+
+- **Fast.** Circle attests the burn after a few seconds instead of waiting for the source chain to finalize, and charges a fee for it. Whisk uses Fast whenever the source chain offers it.
+- **Standard.** Circle attests after the source chain finalizes. On Ethereum and most rollups that settle to it, that takes about 15 to 19 minutes, and on Linea several hours. On chains with fast finality, such as Arc, Avalanche and Polygon, Standard is already quick, which is why Circle offers no Fast Transfer from them.
+
+```ts
+import { getChain } from "@usewhisk/react";
+
+const source = getChain("Arbitrum");
+const speed = source.capabilities.fastSource ? "Fast" : "Standard";
+const forwarded = getChain("Base").capabilities.forwardingDestination;
+```
+
+The mint on the destination is submitted by Circle's Forwarding Service when the destination supports it and the source is an EVM chain or Solana. Otherwise the payer connects a wallet on the destination and signs the mint. The fees for each part are in the quote the payer confirms. See [how it works](/concepts/how-it-works) and [quotes and fees](/concepts/quotes-and-fees).
+
+## EVM chains the evm() factory cannot switch to
+
+`evm()` builds its wagmi config from wallet definitions for 36 of the 50 EVM ids. `Cronos`, `Edge`, `Injective`, `Morph`, `Pharos`, `Plasma`, `X_Layer` and their testnets are in the registry, but `evm()` drops them, so the widget cannot switch a wallet to them. To use them, bring your own wagmi config. See [wallets](/wallets#bring-your-own-wagmi-config).
