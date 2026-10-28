@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Typecheck, test and build gates join when the app scaffold lands.
 set -euo pipefail
 
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
@@ -12,9 +11,17 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   exit 1
 fi
 
+# The Mintlify CLI runs through npx, not as a dependency: its own dependency tree
+# carries high advisories that would fail the audit, and none of it reaches readers.
+MINT="npx -y mint@4.2.993"
+
 echo "=== Preflight ==="
-echo "[1/2] Format"
+echo "[1/4] Format"
 pnpm exec prettier --check .
-echo "[2/2] Lint"
+echo "[2/4] Lint"
 shellcheck scripts/*.sh scripts/hooks/*.sh
+echo "[3/4] Mintlify build"
+$MINT validate
+echo "[4/4] Links"
+$MINT broken-links --check-anchors
 echo "All preflight gates passed."

@@ -1,0 +1,767 @@
+---
+title: "Engine"
+description: "Every WhiskEngine method with its parameters, return type and the errors it throws, plus the wallet adapter interfaces."
+---
+
+`createWhisk` returns a `WhiskEngine`. Its methods take plain objects and wallet adapters, and never hold a wallet themselves.
+
+```ts send.ts
+import { createWhisk, type EvmAdapter } from "@usewhisk/core";
+
+declare const adapter: EvmAdapter;
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+const recipient = await engine.resolve(
+  "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  "Arc_Testnet",
+);
+const quote = await engine.quote({
+  sourceChain: "Base_Sepolia",
+  destinationChain: "Arc_Testnet",
+  recipient,
+  amount: "25",
+  adapter,
+});
+const result = await engine.send({ quote, adapter });
+console.log(result.kind, result.steps);
+```
+
+```ts
+interface WhiskEngine {
+  readonly config: WhiskConfig;
+  resolve(input: string, chain: Chain): Promise<ResolvedRecipient>;
+  quote(params: QuoteParams): Promise<Quote>;
+  send(params: SendParams, listeners?: SendListeners): Promise<SendResult>;
+  balance(params: { chain: Chain; address: string }): Promise<bigint | null>;
+  maxSendable(params: Omit<QuoteParams, "amount">): Promise<MaxSendable | null>;
+  inflight(): Promise<readonly InflightRecord[]>;
+  dismiss(id: string): Promise<void>;
+  resume(
+    record: InflightRecord,
+    options?: ResumeOptions,
+    listeners?: SendListeners,
+  ): Promise<SendResult>;
+  resumeFromTx(
+    params: ResumeFromTxParams,
+    listeners?: SendListeners,
+  ): Promise<SendResult>;
+  refund(
+    params: RefundParams,
+    listeners?: SendListeners,
+  ): Promise<RefundResult>;
+}
+```
+
+## Throwing versus returning a failure
+
+The rule that keeps money safe: **anything thrown happened before a signature**, apart from the `resume` cases listed below. Once the engine asks a wallet to sign, problems come back as a `SendResult` with `kind: "failure"`, its `steps` showing which step failed and whether the burn landed.
+
+| Outcome                                                     | Funds                                                                                 | What to do                                          |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `send` throws                                               | Nothing signed, nothing moved.                                                        | Fix the cause or quote again.                       |
+| `kind: "failure"`, failed step `approve` or `transfer`      | No burn, and no merchant fee taken.                                                   | Show the error; the payer can try again.            |
+| `kind: "failure"`, failed step `burn`                       | The burn may or may not have landed. Check `steps[n].txHash` and the inflight record. | Call `resume` or `resumeFromTx` if a hash exists.   |
+| `kind: "failure"`, failed step `fetchAttestation` or `mint` | Burned. USDC is in flight.                                                            | Call `resume` later. The record stays in the store. |
+
+The error codes are in [Errors](/reference/core/errors).
+
+## config
+
+```ts
+readonly config: WhiskConfig;
+```
+
+The config passed to `createWhisk`, with `feeBearer` and `useForwarder` defaults filled in.
+
+## resolve
+
+```ts
+resolve(input: string, chain: Chain): Promise<ResolvedRecipient>;
+```
+
+Turns what the payer typed into a recipient on `chain`, with the configured `resolver`. Input is trimmed first.
+
+<ParamField path="input" type="string" required>
+  An address, or anything the resolver accepts (such as an ENS name with the
+  React default resolver).
+</ParamField>
+
+<ParamField path="chain" type="Chain" required>
+  The destination chain. Resolvers use it to pick the address format and, for
+  ENS, the coin type.
+</ParamField>
+
+**Returns** a [ResolvedRecipient](/reference/core/types#recipients).
+
+**Throws**
+
+- `ConfigError` when no resolver matches the input, or the matching resolvers return `null`.
+- `ResolverError` when a resolver inside `composeResolvers` throws, or an ENS lookup fails.
+
+## quote
+
+```ts
+quote(params: QuoteParams): Promise<Quote>;
+```
+
+Prices a transfer. A same-chain route returns at once with no network calls, except into Starknet, where the recipient's account is read first. A bridge plans the route, checks Circle's Fast allowance, and reads Circle's fees from Iris (and, for Standard burns on chains with a fee switch, the on-chain minimum fee). Every quote expires 60 seconds after `issuedAt`.
+
+<ParamField path="sourceChain" type="Chain" required>
+  Where the payer's USDC is. Its network decides mainnet or testnet.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain" required>
+  Equal to `sourceChain` for a same-chain send.
+</ParamField>
+
+<ParamField path="recipient" type="ResolvedRecipient" required>
+  From `resolve`, or built by hand as `{ address, chain }`. The address is checked against the destination's format: EVM hex address, Solana public key, Stellar strkey or Starknet felt.
+</ParamField>
+
+<ParamField path="amount" type="string" required>
+  Decimal USDC, such as `"1.50"`. Digits past the sixth decimal are dropped,
+  never rounded up. Must be positive.
+</ParamField>
+
+<ParamField path="adapter" type="WhiskAdapter" required>
+  The payer's wallet. Its `kind` must match the source chain's ecosystem when
+  you send.
+</ParamField>
+
+<ParamField path="destinationAdapter" type="WhiskAdapter">
+  The wallet that signs the mint when Circle does not forward it, for a route
+  into another ecosystem. The plan checks that every wallet the route needs is
+  present.
+</ParamField>
+
+<ParamField path="token" type="Token">
+  Label for the quote's `token` and fee entries. Defaults to `"USDC"`. Bridges
+  always move USDC.
+</ParamField>
+
+<ParamField path="allowUndeployedRecipient" type="boolean">
+  Quote to a Starknet address with no account deployed yet. USDC sent there
+  waits for whoever deploys the account, so set it only once the payer has
+  confirmed the address is their own new wallet. Defaults to `false`.
+</ParamField>
+
+Into Starknet, for a bridge or a same-chain send, `quote` refuses an address below `2**160` (almost always an Ethereum address) or at or past `2**251 - 256`, then reads `starknet_getClassHashAt` for it over the destination's `rpcUrls` and the registry's defaults. The connected Starknet wallet's own address, as `adapter` or `destinationAdapter`, skips that read. See [recipients](/concepts/recipients#starknet-felt-addresses).
+
+**Returns** a [Quote](/reference/core/types#quote). Show `amountIn` as "You pay" and `amountOut` as "Recipient gets".
+
+**Throws**
+
+- `InvalidAddressError` when the recipient address does not fit the destination chain, or a Starknet recipient is Ethereum-shaped or out of range.
+- `ConfigError` when the amount is not a positive decimal, the chains are missing, or with `feeBearer: "receiver"` the fees exceed the amount.
+- `NetworkMismatchError` when one chain is mainnet and the other testnet.
+- On a bridge, `RouteUnavailableError` with `reason: "source_adapter_required"` when `adapter` is not a wallet of the source ecosystem, or `"destination_adapter_required"` when the mint needs a wallet you did not pass.
+- Into Starknet, `RouteUnavailableError` with `reason: "recipient_not_deployed"` when no account is deployed at the recipient and `allowUndeployedRecipient` is not set, and a `WhiskError` wrapping the RPC error when the class hash cannot be read.
+- Errors from `@usewhisk/cctp`, which are not `WhiskError`s: `IrisError` subclasses when Iris is unreachable, rate limited or returns something unexpected, `ProtocolError` when an RPC read fails or a fee tier is missing, `UnknownChainError` for an id outside the registry. Pass them through `toWhiskError` for a uniform shape.
+
+## send
+
+```ts
+send(params: SendParams, listeners?: SendListeners): Promise<SendResult>;
+```
+
+Executes the quote the payer confirmed. Chains, recipient and amounts all come from `params.quote`; the engine burns exactly `quote.subunits.burnAmount` and never re-prices silently. Before anything is signed it:
+
+1. Validates `metadata`.
+2. Refuses a quote past `expiresAt`.
+3. On an EVM source, reads the payer's USDC and refuses when it cannot cover `quote.subunits.amountIn` plus, on Arc, the USDC gas reserve.
+4. For a bridge, plans the route again and checks Circle's current fees still fit under the confirmed `maxFee`. For an upfront-fee quote it fetches Circle's signed fee quote and checks it the same way.
+
+Into Stellar and Starknet, the route then checks the destination wallet's network, and for a Stellar `G` or `M` recipient its USDC trustline, before the source wallet is asked for anything. A failed check comes back as a failure with nothing signed. See [fund safety](/concepts/fund-safety#checks-before-the-burn).
+
+With a `feePolicy` on an EVM source, the fee goes in one atomic batch with the burn or transfer when `adapter.supportsAtomicBatch` says yes for the source chain, and otherwise as separate requests once the burn or transfer has landed. See [when the fee is paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+For a bridge, it writes an inflight record before the wallet is asked (`step: "signing"`), updates it the moment the burn hash comes back (`"burned"`), after attestation (`"attested"`) and after the mint (`"minted"`). A transfer that never burned leaves no record.
+
+```ts sendConfirmed.ts
+import {
+  QuoteChangedError,
+  QuoteExpiredError,
+  type EvmAdapter,
+  type Quote,
+  type SendResult,
+  type WhiskEngine,
+} from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare const adapter: EvmAdapter;
+declare function confirmWithPayer(quote: Quote): Promise<boolean>;
+
+export async function sendConfirmed(quote: Quote): Promise<SendResult | null> {
+  try {
+    return await engine.send(
+      { quote, adapter, metadata: { orderId: "A-1001" } },
+      {
+        onBurnSubmitted: (txHash) => console.log("burn sent", txHash),
+        onStep: (step) => console.log(step.name, step.state, step.txHash),
+      },
+    );
+  } catch (err) {
+    if (err instanceof QuoteChangedError) {
+      return (await confirmWithPayer(err.quote))
+        ? sendConfirmed(err.quote)
+        : null;
+    }
+    if (err instanceof QuoteExpiredError) return null;
+    throw err;
+  }
+}
+```
+
+<ParamField path="quote" type="Quote" required>
+  The quote the payer confirmed. Not older than 60 seconds.
+</ParamField>
+
+<ParamField path="adapter" type="WhiskAdapter" required>
+  The payer's wallet, of the source chain's ecosystem.
+</ParamField>
+
+<ParamField path="destinationAdapter" type="WhiskAdapter">
+  The wallet that signs the mint when Circle does not forward it. Required for
+  bridges into Solana, Stellar and Starknet, and from Stellar or Starknet into
+  EVM.
+</ParamField>
+
+<ParamField path="metadata" type="WhiskMetadata">
+  Correlation data, merged over `config.defaultMetadata` and echoed on the
+  result. See [Metadata](/flows/metadata).
+</ParamField>
+
+<ParamField path="listeners" type="SendListeners">
+  Progress callbacks.
+
+  <Expandable title="SendListeners">
+    <ParamField path="onStep" type="(step: Step) => void">
+      Called each time a step changes state.
+    </ParamField>
+    <ParamField path="onBurnSubmitted" type="(txHash: string) => void">
+      Called with the burn hash as soon as the wallet returns it, before any receipt wait. If you keep your own records, save the hash here: it is what `resumeFromTx` needs.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+**Returns** a [SendResult](/reference/core/types#sendresult): `{ kind: "success", finalTxHash?, steps, customFee?, metadata? }` or `{ kind: "failure", error, steps, raw?, customFee?, metadata? }`. For a forwarded bridge, `finalTxHash` is the forwarder's mint hash. `customFee` is set whenever a `feePolicy` fee applied; see [CustomFeeOutcome](/reference/core/types#sendresult).
+
+**Throws** (all before any signature)
+
+- `ConfigError` for invalid metadata, a `feePolicy.recipient` that is not an EVM address, an adapter whose `kind` does not match the chain, or a missing `destinationAdapter` on routes that require one.
+- `QuoteExpiredError` when the quote is past `expiresAt`, or Circle's signed upfront fee expired twice in a row.
+- `InsufficientBalanceError` when an EVM payer cannot cover the debit and Arc gas.
+- `QuoteChangedError` when the route's speed or mint method changed, or Circle's fees rose past `maxFee`. `err.quote` is a fresh quote to show the payer.
+- `NetworkMismatchError` and `RouteUnavailableError`, as for `quote`.
+- `@usewhisk/cctp` errors from the Iris fee read or the balance read.
+
+## balance
+
+```ts
+balance(params: { chain: Chain; address: string }): Promise<bigint | null>;
+```
+
+The USDC balance of `address` on `chain`, in 6-decimal subunits. Returns `null` on Solana, Stellar and Starknet, where the engine does not read balances.
+
+**Throws** `ProtocolError` (from `@usewhisk/cctp`) when every RPC fails.
+
+## maxSendable
+
+```ts
+maxSendable(params: Omit<QuoteParams, "amount">): Promise<MaxSendable | null>;
+```
+
+The largest amount the payer can send on this route: the balance, less the fees the payer covers and, on Arc, the gas paid from the same USDC. It quotes up to six times to converge. Returns `null` when `adapter` is not an EVM wallet.
+
+```ts max.ts
+import type { EvmAdapter, WhiskEngine } from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare const adapter: EvmAdapter;
+
+const held = await engine.balance({
+  chain: "Arc_Testnet",
+  address: adapter.address,
+});
+
+const max = await engine.maxSendable({
+  sourceChain: "Arc_Testnet",
+  destinationChain: "Base_Sepolia",
+  recipient: { address: adapter.address, chain: "Base_Sepolia" },
+  adapter,
+});
+console.log(held, max?.amount, max?.balance, max?.gasReserve);
+```
+
+Takes the `QuoteParams` fields except `amount`. Fees do not depend on the recipient, so the payer's own address can stand in before one is entered. The recipient checks `quote` runs are skipped here, so Max works for a bridge into Solana or Starknet before a recipient is entered.
+
+<ResponseField name="amount" type="string">
+  Decimal USDC, ready for the amount field and `quote`. `"0"` when nothing fits.
+</ResponseField>
+
+<ResponseField name="balance" type="bigint">
+  The payer's USDC, in subunits.
+</ResponseField>
+
+<ResponseField name="gasReserve" type="bigint">
+  USDC subunits kept back for gas. Non-zero only on Arc.
+</ResponseField>
+
+**Throws** what `quote` and `balance` throw.
+
+## inflight
+
+```ts
+inflight(): Promise<readonly InflightRecord[]>;
+```
+
+The bridges in the engine's `inflightStore`, oldest first. Includes `minted` records until you `dismiss` them. See [InflightRecord](/reference/core/types#inflight-records).
+
+**Throws** whatever the store throws.
+
+## dismiss
+
+```ts
+dismiss(id: string): Promise<void>;
+```
+
+Removes a record from the store. Burned records are never removed automatically, so call this once the payer has seen the transfer finish or chose to drop it. Dismissing does not stop or undo a transfer.
+
+## resume
+
+```ts
+resume(record: InflightRecord, options?: ResumeOptions, listeners?: SendListeners): Promise<SendResult>;
+```
+
+Finishes a bridge from its record without signing the burn again. It checks the burn did not revert (EVM sources), waits for the attestation, checks the attested message matches the record's destination and amount, then:
+
+- For a forwarded record, waits for Circle's relayer. If the relayer reports `FAILED`, it mints with `destinationAdapter` instead.
+- Otherwise checks whether the destination already received the message, and if not, mints with `destinationAdapter`. An expired attestation is re-attested and the mint tried once more.
+
+It updates the record as it goes. A reverted burn removes the record.
+
+```ts resumeAll.ts
+import type { WhiskAdapter, WhiskEngine } from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare const destinationAdapter: WhiskAdapter | undefined;
+
+for (const record of await engine.inflight()) {
+  if (record.step === "minted") {
+    await engine.dismiss(record.id);
+    continue;
+  }
+  const result = await engine.resume(record, { destinationAdapter });
+  if (result.kind === "failure" && result.error.retryable) {
+    console.log("try again later:", result.error.message);
+  }
+}
+
+const fromLink = await engine.resumeFromTx({
+  sourceChain: "Base_Sepolia",
+  txHash: "0x5f2c9a1e7b3d4c6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
+  destinationAdapter,
+});
+console.log(fromLink.kind);
+```
+
+<ParamField path="record" type="InflightRecord" required>
+  From `inflight()`, or your own copy of one.
+</ParamField>
+
+<ParamField path="options.destinationAdapter" type="WhiskAdapter">
+  Signs the mint when Circle does not, or when its relayer failed. Not needed
+  for a transfer Circle forwards.
+</ParamField>
+
+<ParamField path="listeners" type="SendListeners">
+  `onStep` reports `burn`, `fetchAttestation` and `mint`.
+</ParamField>
+
+**Returns** a `SendResult`. A failure here never means new money moved. When the record has a `customFee`, the result reports it from the record, and `resume` never asks for the fee again. Failures it returns:
+
+- `ConfigError` (step `burn`) when the record has no `sourceTxHash`: the wallet was asked but never returned a burn hash. Use `resumeFromTx` if the wallet shows one.
+- `OnchainRevertError` (step `burn`) when the burn reverted. No USDC left the wallet.
+- `BridgeStepError` (retryable) when Circle has not attested yet, or its relayer has not minted yet. Resume again later.
+- `ConfigError` (step `fetchAttestation`) when the attested message is for another destination or amount than the record.
+- `OnchainRevertError` (step `mint`) when the EVM mint reverted, after one re-attestation if the attestation had expired.
+- On Solana, Stellar and Starknet destinations, wallet errors during the mint (`UserRejectedError`, `WrongChainError`, ...).
+
+**Throws**
+
+- `RouteUnavailableError` with `reason: "destination_adapter_required"` when the mint needs a wallet and `destinationAdapter` is missing or of the wrong ecosystem.
+- On EVM destinations, wallet errors from the mint (`UserRejectedError`, `WrongChainError`, `NetworkError`, ...) and `BridgeStepError` when a needed re-attestation is not ready.
+- `@usewhisk/cctp` errors when Iris or an RPC is unreachable.
+
+In every thrown case the burn has already happened and the record is still in the store, so the payer can try again.
+
+## resumeFromTx
+
+```ts
+resumeFromTx(params: ResumeFromTxParams, listeners?: SendListeners): Promise<SendResult>;
+```
+
+As `resume`, from the burn's hash alone, such as from a receipt link or `onBurnSubmitted`. If the store has a record for that hash it is used; otherwise one is built from what Iris decoded and saved to the store.
+
+<ParamField path="sourceChain" type="Chain" required>
+  Chain the burn was sent on.
+</ParamField>
+
+<ParamField path="txHash" type="string" required>
+  The burn transaction hash. Matched case-insensitively against stored records.
+</ParamField>
+
+<ParamField path="destinationAdapter" type="WhiskAdapter">
+  As in `resume`.
+</ParamField>
+
+**Throws** what `resume` throws, and `BridgeStepError` (retryable) when Iris has not seen a burn in that transaction yet.
+
+## refund
+
+```ts
+refund(params: RefundParams, listeners?: SendListeners): Promise<RefundResult>;
+```
+
+Sends funds back to the payer of an earlier transfer. It is an ordinary send from `merchantAdapter` on `originalDestinationChain` to `originalSenderAddress` on `refundDestinationChain`, quoted and executed in one call with the config's fee settings. The result's `metadata` carries `__refundOfTxHash` and, when given, `__refundReason`. See [Refunds](/flows/refunds).
+
+```ts refund.ts
+import type { EvmAdapter, WhiskEngine } from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare const merchantWallet: EvmAdapter;
+
+const refund = await engine.refund({
+  originalTxHash:
+    "0x5f2c9a1e7b3d4c6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
+  originalDestinationChain: "Arc_Testnet",
+  refundDestinationChain: "Base_Sepolia",
+  originalSenderAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  amount: "10.50",
+  reason: "Item out of stock",
+  merchantAdapter: merchantWallet,
+});
+console.log(refund.metadata?.__refundOfTxHash);
+```
+
+<ParamField path="originalTxHash" type="string" required>
+  Source-chain hash of the original transfer. Stored as `__refundOfTxHash`.
+</ParamField>
+
+<ParamField path="originalDestinationChain" type="Chain" required>
+  Where the merchant received the payment. The refund is sent from here.
+</ParamField>
+
+<ParamField path="refundDestinationChain" type="Chain" required>
+  Where the refund lands, usually the chain the payer paid from.
+</ParamField>
+
+<ParamField path="originalSenderAddress" type="string" required>
+  The refund recipient.
+</ParamField>
+
+<ParamField path="amount" type="string" required>
+  Decimal USDC. May be less than the original.
+</ParamField>
+
+<ParamField path="reason" type="string">
+  At most 256 characters. Stored as `__refundReason`.
+</ParamField>
+
+<ParamField path="metadata" type="WhiskMetadata">
+  Extra correlation data. No `__` keys.
+</ParamField>
+
+<ParamField path="merchantAdapter" type="WhiskAdapter" required>
+  The wallet holding the funds being refunded.
+</ParamField>
+
+<ParamField path="destinationAdapter" type="WhiskAdapter">
+  Signs the mint when Circle does not forward it.
+</ParamField>
+
+**Returns** a `RefundResult`, which is a `SendResult`.
+
+**Throws** `ConfigError` from [validateRefundInput](/reference/core/types#refunds) before anything else, then what `quote` and `send` throw, except that a refund skips the expiry and balance checks: it quotes and sends at once.
+
+## Adapters
+
+The engine builds calls and hands them to an adapter to sign and submit. Each ecosystem has its own shape, told apart by `kind`. `@usewhisk/react` ships one per ecosystem ([wallet adapter hooks](/reference/react/hooks#wallet-adapter-hooks)); write your own for a server wallet or another wallet library. Adapters should throw `WhiskError`s (use `toWhiskError`), because the engine does not reclassify errors.
+
+```ts
+type WhiskAdapter =
+  EvmAdapter | SolanaAdapter | StellarAdapter | StarknetAdapter;
+```
+
+`SolanaAdapter`, `StellarAdapter`, `StarknetAdapter`, their receipt types and `StellarTrustline` are exported from `@usewhisk/core` only.
+
+```ts evmAdapter.ts
+import type { EvmAdapter } from "@usewhisk/core";
+
+declare function signAndSend(tx: {
+  to: `0x${string}`;
+  data: `0x${string}`;
+  value: bigint;
+}): Promise<`0x${string}`>;
+declare function waitFor(hash: `0x${string}`): Promise<{
+  status: "success" | "reverted";
+  blockNumber: bigint;
+}>;
+declare let currentChainId: number;
+
+export const adapter: EvmAdapter = {
+  kind: "evm",
+  address: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  async getChainId() {
+    return currentChainId;
+  },
+  async switchChain(chainId) {
+    currentChainId = chainId;
+  },
+  async sendCalls(calls, options) {
+    const hashes: `0x${string}`[] = [];
+    for (const [index, call] of calls.entries()) {
+      const hash = await signAndSend(call);
+      hashes.push(hash);
+      options?.onSubmitted?.(hash, index);
+      await waitFor(hash);
+    }
+    return { hashes };
+  },
+  waitForReceipt: waitFor,
+};
+```
+
+### EvmAdapter
+
+<ResponseField name="kind" type={'"evm"'} required>
+  Discriminant.
+</ResponseField>
+
+<ResponseField name="address" type="`0x${string}`" required>
+  The wallet address.
+</ResponseField>
+
+<ResponseField name="getChainId" type="() => Promise<number>" required>
+  The wallet's current chain id. The engine reads it before each write and
+  switches when it differs.
+</ResponseField>
+
+<ResponseField
+  name="switchChain"
+  type="(chainId: number) => Promise<void>"
+  required
+>
+  Rejects with `WrongChainError` when the user declines or the wallet lacks the
+  chain.
+</ResponseField>
+
+<ResponseField
+  name="supportsAtomicBatch"
+  type="(chainId: number) => Promise<boolean>"
+>
+  Optional. Whether `sendCalls` can land a batch on `chainId` all or nothing.
+  The engine asks before a transfer that carries a `feePolicy` fee, and sends
+  the fee in the same batch only when this says yes. Without it, the fee is a
+  separate request once the burn or transfer has landed.
+</ResponseField>
+
+<ResponseField
+  name="sendCalls"
+  type="(calls: EvmCall[], options?: SendCallsOptions) => Promise<SendCallsResult>"
+  required
+>
+  Signs and submits `calls`. Without `options.atomic`, submit in array order and
+  wait for each receipt before the next, or a burn can race its approve. With
+  `atomic: true`, land every call or none, as one EIP-5792 batch, or throw
+  `WalletCapabilityError("atomic_unsupported", ...)` before sending anything;
+  the engine then sends the calls one by one. Throws a `WhiskError`.
+</ResponseField>
+
+<ResponseField
+  name="waitForReceipt"
+  type="(hash: `0x${string}`) => Promise<CallReceipt>"
+  required
+>
+  The adapter picks the timeout; the engine treats a timeout as a failure of the
+  step it was waiting on.
+</ResponseField>
+
+<ResponseField name="EvmCall" type="object">
+  <Expandable title="EvmCall">
+    <ResponseField name="to" type="`0x${string}`" required>
+      Target contract.
+    </ResponseField>
+    <ResponseField name="data" type="`0x${string}`" required>
+      Calldata.
+    </ResponseField>
+    <ResponseField name="value" type="bigint" required>
+      Native value in wei. Always `0n` for CCTP calls.
+    </ResponseField>
+    <ResponseField name="maxFeePerGas" type="bigint">
+      Set by the engine on Arc, which drops transactions under its 20 gwei
+      floor. Pass it through when set.
+    </ResponseField>
+    <ResponseField name="maxPriorityFeePerGas" type="bigint">
+      Set with `maxFeePerGas`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField
+  name="SendCallsOptions"
+  type="{ onSubmitted?: (hash: `0x${string}`, index: number) => void; atomic?: boolean }"
+>
+  Call `onSubmitted` with each hash as soon as the wallet returns it, before
+  waiting for a receipt. `index` is the call it covers; a batch sharing one hash
+  reports it once, for the last call. The engine uses it to save the burn hash
+  early. `atomic` asks for an all-or-nothing batch; the engine sets it only
+  after `supportsAtomicBatch` said yes.
+</ResponseField>
+
+<ResponseField name="SendCallsResult" type="{ hashes: `0x${string}`[] }">
+  Hashes in submission order. An EIP-5792 batch may return a single hash for all
+  calls.
+</ResponseField>
+
+<ResponseField
+  name="CallReceipt"
+  type={'{ status: "success" | "reverted"; blockNumber: bigint }'}
+>
+  What `waitForReceipt` resolves to.
+</ResponseField>
+
+### SolanaAdapter
+
+<ResponseField name="kind" type={'"solana"'} required>
+  Discriminant.
+</ResponseField>
+
+<ResponseField name="address" type="string" required>
+  Base58 public key.
+</ResponseField>
+
+<ResponseField
+  name="getCluster"
+  type={'() => Promise<"mainnet-beta" | "devnet">'}
+  required
+>
+  Checked against the chain before burns and mints.
+</ResponseField>
+
+<ResponseField
+  name="sendTransaction"
+  type="(instructions: SolanaInstruction[], options?: { extraSigners?: SolanaExtraSigner[] }) => Promise<{ signature: string }>"
+  required
+>
+  Fetch a recent blockhash, set the wallet as fee payer, partial-sign with each
+  extra signer, then have the wallet sign and send.
+</ResponseField>
+
+<ResponseField name="confirmTransaction" type="(signature: string) => Promise<SolanaTransactionReceipt>" required>
+  Wait at the wallet's usual commitment, typically `confirmed`. Resolves to `{ status: "success" | "reverted"; slot: bigint }`.
+</ResponseField>
+
+<ResponseField
+  name="getAccountInfo"
+  type="(pubkey: string) => Promise<{ data: Uint8Array } | null>"
+  required
+>
+  `null` when the account does not exist. The engine uses it to check the
+  recipient's USDC account before burning and to read CCTP state.
+</ResponseField>
+
+<ResponseField
+  name="SolanaExtraSigner"
+  type="{ publicKey: string; secretKey: Uint8Array }"
+>
+  A one-off keypair the engine generates, such as the CCTP burn's
+  `message_sent_event_data` account. `secretKey` is the 64-byte ed25519 key.
+</ResponseField>
+
+### StellarAdapter
+
+<ResponseField name="kind" type={'"stellar"'} required>
+  Discriminant.
+</ResponseField>
+
+<ResponseField name="address" type="string" required>
+  Usually a `G...` strkey.
+</ResponseField>
+
+<ResponseField
+  name="getNetwork"
+  type={'() => Promise<"public" | "testnet">'}
+  required
+>
+  Checked against the chain before a burn into Stellar and before mints.
+</ResponseField>
+
+<ResponseField
+  name="submitInvocation"
+  type="(invocations: StellarInvocation[]) => Promise<{ hashes: string[] }>"
+  required
+>
+  Soroban allows one host function per transaction, so submit each invocation on
+  its own and wait until it lands before the next. Build, simulate, sign and
+  submit. The engine treats the last hash as the main one.
+</ResponseField>
+
+<ResponseField name="confirmTransaction" type="(hash: string) => Promise<StellarTransactionReceipt>" required>
+  Resolves to `{ status: "success" | "reverted"; ledger: number }`.
+</ResponseField>
+
+<ResponseField name="getLatestLedger" type="() => Promise<number>" required>
+  The engine sets the USDC approval expiry from it.
+</ResponseField>
+
+<ResponseField
+  name="getTrustline"
+  type="(account: string, asset: { code: string; issuer: string }) => Promise<StellarTrustline | null>"
+>
+  Optional. The account's trustline for `asset`, or `null` when it has none.
+  Before a burn into Stellar the engine reads the recipient's USDC trustline
+  through the destination adapter's `getTrustline`, and refuses a classic
+  account whose trustline is missing, not authorized or full. Throw on an RPC
+  failure rather than returning `null`. Without this method, a bridge into a `C`
+  address still works, and a bridge into a `G` or `M` address is refused before
+  the burn with `ConfigError`.
+</ResponseField>
+
+<ResponseField
+  name="StellarTrustline"
+  type="{ balance: bigint; limit: bigint; authorized: boolean }"
+>
+  `balance` and `limit` in stroops (7 decimals). `authorized` is the issuer's
+  `AUTHORIZED` flag; without it the account cannot receive.
+</ResponseField>
+
+### StarknetAdapter
+
+<ResponseField name="kind" type={'"starknet"'} required>
+  Discriminant.
+</ResponseField>
+
+<ResponseField name="address" type="string" required>
+  felt252 hex.
+</ResponseField>
+
+<ResponseField name="getChainId" type="() => Promise<string>" required>
+  The wallet's chain id felt, checked before each write.
+</ResponseField>
+
+<ResponseField
+  name="submitCalls"
+  type="(calls: StarknetCall[]) => Promise<{ hashes: string[] }>"
+  required
+>
+  A single multicall is preferred. The engine treats the last hash as the main
+  one.
+</ResponseField>
+
+<ResponseField name="confirmTransaction" type="(hash: string) => Promise<StarknetTransactionReceipt>" required>
+  Resolves to `{ status: "success" | "reverted"; blockNumber: number }`.
+</ResponseField>
+
+`SolanaInstruction`, `StellarInvocation` and `StarknetCall` come from `@usewhisk/cctp`. See [Builders](/reference/cctp/builders).

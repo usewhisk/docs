@@ -1,0 +1,960 @@
+---
+title: "Types and helpers"
+sidebarTitle: "Types"
+description: "The public types of @usewhisk/core and its helper functions and constants, grouped by topic."
+---
+
+Everything here is exported from `@usewhisk/core`. Types without runtime code are also on `@usewhisk/core/types`, together with `DEFAULT_TOKEN`, `DEFAULT_FEE_BEARER`, `isBridgeRoute` and `isSendRoute`, so a type-only import pulls in nothing else.
+
+```ts summary.ts
+import type { Quote, SendResult, Step } from "@usewhisk/core";
+import { formatUsdcAmount, isBridgeRoute } from "@usewhisk/core";
+
+export function summary(quote: Quote): string {
+  const route = isBridgeRoute(quote.route)
+    ? `${quote.route.sourceChain} to ${quote.route.destinationChain}`
+    : quote.route.chain;
+  return `${route}: you pay ${quote.amountIn}, recipient gets ${formatUsdcAmount(quote.subunits.amountOut)} ${quote.token}`;
+}
+
+export function lastTx(result: SendResult): string | undefined {
+  const done: Step[] = result.steps.filter((s) => s.state === "success");
+  return result.kind === "success" ? result.finalTxHash : done.at(-1)?.txHash;
+}
+```
+
+## Amounts
+
+USDC amounts are decimal strings at the API edge and `bigint` subunits inside, with 6 decimals. Stellar's 7-decimal balances are scaled at the edge. See [Amounts and units](/concepts/amounts-and-units).
+
+```ts
+import {
+  formatUsdcAmount,
+  parseUsdcAmount,
+  USDC_DECIMALS,
+} from "@usewhisk/core";
+
+const subunits = parseUsdcAmount("12.3456789");
+console.log(subunits, formatUsdcAmount(subunits), USDC_DECIMALS);
+```
+
+| Export             | Signature                      | Notes                                                                                                                                                                                              |
+| ------------------ | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `USDC_DECIMALS`    | `6`                            | The decimals CCTP messages carry.                                                                                                                                                                  |
+| `parseUsdcAmount`  | `(input: string) => bigint`    | Trims, then accepts digits with at most one dot. Digits past the sixth decimal are dropped, never rounded. Throws `ConfigError` for anything else, and for zero. `"12.3456789"` gives `12345678n`. |
+| `formatUsdcAmount` | `(subunits: bigint) => string` | Strips trailing zeros: `1500000n` gives `"1.5"`. Throws `ConfigError` for negative input.                                                                                                          |
+
+## Chains
+
+<ResponseField name="Chain" type="string union">
+  A chain id from the registry, such as `"Ethereum"`, `"Base_Sepolia"`,
+  `"Arc_Testnet"`, `"Solana_Devnet"`, `"Stellar"` or `"Starknet_Sepolia"`. The
+  same strings Circle's App Kit uses. Full list: [Chains](/chains).
+</ResponseField>
+
+<ResponseField
+  name="ChainKind"
+  type={'"evm" | "solana" | "stellar" | "starknet"'}
+>
+  The ecosystem of a chain.
+</ResponseField>
+
+<ResponseField name="ChainNetwork" type={'"mainnet" | "testnet"'}>
+  Every transfer stays on the network of its source chain.
+</ResponseField>
+
+<ResponseField
+  name="CctpChain"
+  type="EvmChain | SolanaChain | StellarChain | StarknetChain"
+>
+  A registry entry: `id`, `label`, `network`, `ecosystem`, `cctpDomain`,
+  `usdcDecimals`, `nativeCurrency`, `defaultRpcUrls`, `explorerUrl`,
+  `capabilities` and the ecosystem's contract addresses. Documented in [CCTP
+  chains](/reference/cctp/chains).
+</ResponseField>
+
+```ts
+import {
+  CHAINS,
+  addressFormat,
+  chainByDomain,
+  chainByEvmChainId,
+  chainsByNetwork,
+  explorerAddressUrl,
+  explorerTxUrl,
+  getChain,
+  isChainId,
+  tryChainByEvmChainId,
+  type CctpChain,
+} from "@usewhisk/core";
+
+const arc: CctpChain = getChain("Arc_Testnet");
+const testnets = chainsByNetwork("testnet").map((c) => c.id);
+const base = chainByEvmChainId(8453);
+const maybe = tryChainByEvmChainId(31337);
+const solana = chainByDomain(5, "mainnet");
+const input = "Base_Sepolia";
+if (isChainId(input)) console.log(explorerTxUrl(input, "0xabc"));
+```
+
+| Export                         | Signature                                                                                          | Notes                                                                                                                   |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `CHAINS`                       | `readonly CctpChain[]`                                                                             | Every chain in the registry, mainnet and testnet.                                                                       |
+| `getChain`                     | `(id: Chain) => CctpChain`                                                                         | Throws `UnknownChainError` (from `@usewhisk/cctp`) for an unknown id.                                                   |
+| `isChainId`                    | `(value: string) => value is Chain`                                                                | Type guard for untrusted input.                                                                                         |
+| `chainsByNetwork`              | `(network: ChainNetwork) => readonly CctpChain[]`                                                  |                                                                                                                         |
+| `chainByEvmChainId`            | `(evmChainId: number) => EvmChain`                                                                 | Throws `UnknownChainError`.                                                                                             |
+| `tryChainByEvmChainId`         | `(evmChainId: number) => EvmChain \| undefined`                                                    | For a wallet's chain id, which can be any chain.                                                                        |
+| `chainByDomain`                | `(domain: number, network: ChainNetwork) => CctpChain`                                             | Mainnet and testnet share CCTP domains. Throws `UnknownChainError`.                                                     |
+| `explorerTxUrl`                | `(chain: Chain, txHash: string) => string`                                                         |                                                                                                                         |
+| `explorerAddressUrl`           | `(chain: Chain, address: string) => string`                                                        | Uses `contract` paths for Starknet and Stellar `C...` addresses.                                                        |
+| `addressFormat`                | `(chain: Chain) => AddressFormat`                                                                  | `{ pattern: RegExp; hint: string }` for the chain's ecosystem. A shape check for forms; `quote` validates fully.        |
+| `getStarknetTransactionStatus` | `(chain: StarknetChain, hash: string, options?: RpcOptions) => Promise<StarknetTransactionStatus>` | Re-exported from `@usewhisk/cctp`. Returns `{ state: "pending" }` or `{ state: "success" \| "reverted"; blockNumber }`. |
+
+## Tokens
+
+<ResponseField
+  name="Token"
+  type={
+    '"USDC" | "EURC" | "USDT" | "USDe" | "DAI" | "PYUSD" | "cirBTC" | "NATIVE"'
+  }
+>
+  Token symbols, kept from Circle's App Kit. Only `"USDC"` moves through Whisk
+  in 0.3.
+</ResponseField>
+
+<ResponseField name="DEFAULT_TOKEN" type="Token">
+  `"USDC"`.
+</ResponseField>
+
+## Recipients
+
+<ResponseField name="ResolvedRecipient" type="object">
+  What `resolve` returns and `quote` takes.
+
+  <Expandable title="ResolvedRecipient">
+    <ResponseField name="address" type="string" required>The address on `chain`.</ResponseField>
+    <ResponseField name="chain" type="Chain" required>The destination chain.</ResponseField>
+    <ResponseField name="displayName" type="string">A label, such as the ENS name.</ResponseField>
+    <ResponseField name="needsClaimLink" type="boolean">For resolvers that create a wallet for an off-platform recipient. The engine does not read it.</ResponseField>
+    <ResponseField name="claimToken" type="string">Paired with `needsClaimLink`. The engine does not read it.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Resolvers
+
+Also exported from `@usewhisk/core/resolvers` (the functions) and `@usewhisk/core/types` (the types).
+
+```ts resolver.ts
+import { addressResolver, composeResolvers } from "@usewhisk/core/resolvers";
+import type { Resolver } from "@usewhisk/core/types";
+
+const handles: Resolver = {
+  name: "handles",
+  matches: (input) => input.startsWith("@"),
+  resolve: async (input, { chain }) => {
+    const res = await fetch(
+      `https://api.example.com/handles/${input.slice(1)}`,
+    );
+    if (res.status === 404) return null;
+    const { address } = (await res.json()) as { address: string };
+    return { address, chain, displayName: input };
+  },
+};
+
+export const resolver = composeResolvers([addressResolver, handles], {
+  name: "app",
+});
+```
+
+<ResponseField name="Resolver" type="object">
+  <Expandable title="Resolver">
+    <ResponseField name="name" type="string" required>
+      Shown in `ResolverError` messages.
+    </ResponseField>
+    <ResponseField name="matches" type="(input: string) => boolean" required>
+      Synchronous shape check. Only matching resolvers are asked to resolve.
+    </ResponseField>
+    <ResponseField
+      name="resolve"
+      type="(input: string, ctx: ResolverContext) => Promise<ResolvedRecipient | null>"
+      required
+    >
+      Return `null` to let the next resolver try. Throw `ResolverError` on
+      unexpected failure.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="ResolverContext" type="{ chain: Chain }">
+  The destination chain the input should resolve on.
+</ResponseField>
+
+<ResponseField name="addressResolver" type="Resolver">
+  Matches input shaped like an address of any ecosystem, and resolves it when it
+  fits the destination chain's format. The engine's default resolver.
+</ResponseField>
+
+<ResponseField
+  name="composeResolvers"
+  type="(resolvers: ReadonlyArray<Resolver>, options?: { name?: string }) => Resolver"
+>
+  Tries each matching resolver in order and returns the first non-null result.
+  An error that is not already a `ResolverError` is wrapped in one. Throws a
+  plain `Error` when `resolvers` is empty. `name` defaults to `"composite"`.
+</ResponseField>
+
+## Routes
+
+<ResponseField
+  name="Route"
+  type="{ kind: 'send'; chain: Chain } | { kind: 'bridge'; sourceChain: Chain; destinationChain: Chain }"
+>
+  Same chain is a send; anything else is a bridge.
+</ResponseField>
+
+<ResponseField
+  name="isBridgeRoute / isSendRoute"
+  type="(route: Route) => boolean"
+>
+  Type guards that narrow a `Route`.
+</ResponseField>
+
+<ResponseField name="RoutePlan" type="object">
+  How a bridge will run. Present on bridge quotes as `quote.plan`.
+
+  <Expandable title="RoutePlan">
+    <ResponseField name="source" type="CctpChain" required>Source registry entry.</ResponseField>
+    <ResponseField name="destination" type="CctpChain" required>Destination registry entry.</ResponseField>
+    <ResponseField name="network" type="ChainNetwork" required>From the source chain.</ResponseField>
+    <ResponseField name="speed" type={'"fast" | "standard"'} required>Fast where the source supports it and the amount fits Circle's remaining Fast allowance; otherwise Standard.</ResponseField>
+    <ResponseField name="mint" type="RouteMint" required>`{ kind: "forwarder" }` when Circle submits the mint, or `{ kind: "adapter"; ecosystem }` when a wallet of that ecosystem must.</ResponseField>
+    <ResponseField name="requiredAdapters" type="readonly ChainKind[]" required>The wallet ecosystems the route needs, source first.</ResponseField>
+    <ResponseField name="etaSeconds" type="{ min: number; max: number }" required>Circle's published attestation time for the source at this speed. The mint adds a few seconds.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+| Export                | Signature                                                            | Notes                                                                                                                                                                   |
+| --------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `decideRoute`         | `(sourceChain: Chain, destinationChain: Chain) => Route`             | Throws `ConfigError` when either is missing.                                                                                                                            |
+| `planRoute`           | `(input: PlanRouteInput) => RoutePlan`                               | Throws `RouteUnavailableError` (`same_chain`, `source_adapter_required`, `destination_adapter_required`) and `NetworkMismatchError`. Does not apply the Fast allowance. |
+| `connectedEcosystems` | `(...adapters: ({ kind: ChainKind } \| undefined)[]) => ChainKind[]` | The distinct `kind`s of the adapters given.                                                                                                                             |
+
+`PlanRouteInput` is `{ source: Chain; destination: Chain; connected?: readonly ChainKind[]; useForwarder: boolean }`. Leave out `connected` to skip the wallet check.
+
+```ts
+import { connectedEcosystems, decideRoute, planRoute } from "@usewhisk/core";
+
+const route = decideRoute("Solana_Devnet", "Arc_Testnet");
+const plan = planRoute({
+  source: "Solana_Devnet",
+  destination: "Arc_Testnet",
+  connected: connectedEcosystems({ kind: "solana" }),
+  useForwarder: true,
+});
+console.log(
+  route.kind,
+  plan.speed,
+  plan.mint,
+  plan.requiredAdapters,
+  plan.etaSeconds,
+);
+```
+
+## Quote
+
+What `engine.quote` returns. Amount strings are decimal USDC; `subunits` holds the same values as 6-decimal `bigint`s, and `send` signs those.
+
+<ResponseField name="id" type="string">
+  New for every quote, including a refreshed one. Bridges use it as the inflight
+  record id.
+</ResponseField>
+
+<ResponseField name="issuedAt" type="number">
+  Milliseconds since the epoch.
+</ResponseField>
+
+<ResponseField name="expiresAt" type="number">
+  `issuedAt` plus 60 seconds. `send` throws `QuoteExpiredError` after it.
+</ResponseField>
+
+<ResponseField name="feeMode" type={'"maxFee" | "upfront"'}>
+  `"maxFee"`: Circle takes its fee out of the burn, capped by `subunits.maxFee`.
+  `"upfront"`: the payer pays Circle's signed fee beside the burn, at most
+  `subunits.maxFee`, and the whole burn mints. Upfront is used only with
+  `feeBearer: "sender"`, from EVM sources that support it, not into Stellar, and
+  only when there is a Fast or forwarding fee to pay.
+</ResponseField>
+
+<ResponseField name="route" type="Route">
+  Send or bridge, with the chains.
+</ResponseField>
+
+<ResponseField name="recipient" type="ResolvedRecipient">
+  Who receives.
+</ResponseField>
+
+<ResponseField name="amountIn" type="string">
+  The most debited from the payer, merchant fee included. Show it as "You pay".
+</ResponseField>
+
+<ResponseField name="amountOut" type="string">
+  The least the recipient gets. Show it as "Recipient gets".
+</ResponseField>
+
+<ResponseField name="amountBurned" type="string">
+  The amount burned on the source chain. Equal to the requested amount on a
+  same-chain send.
+</ResponseField>
+
+<ResponseField name="token" type="Token">
+  `"USDC"` unless `QuoteParams.token` says otherwise.
+</ResponseField>
+
+<ResponseField name="fees" type="FeeBreakdown">
+  The fee lines. See [Fees](#fees).
+</ResponseField>
+
+<ResponseField name="subunits" type="object">
+  <Expandable title="subunits">
+    <ResponseField name="requested" type="bigint">
+      The amount the payer entered.
+    </ResponseField>
+    <ResponseField name="amountIn" type="bigint">
+      Debited from the payer, merchant fee included.
+    </ResponseField>
+    <ResponseField name="burnAmount" type="bigint">
+      Burned on the source chain. `0n` on a same-chain send.
+    </ResponseField>
+    <ResponseField name="burnFee" type="bigint">
+      Circle's protocol fee, before the Fast buffer.
+    </ResponseField>
+    <ResponseField name="forwarderFee" type="bigint">
+      Circle's forwarding fee, `0n` when not forwarded.
+    </ResponseField>
+    <ResponseField name="maxFee" type="bigint">
+      The cap on Circle's fees: `burnFee` plus 10% on Fast, plus `forwarderFee`.
+    </ResponseField>
+    <ResponseField name="amountOut" type="bigint">
+      The least the recipient gets.
+    </ResponseField>
+    <ResponseField name="customFee" type="bigint">
+      The merchant fee, `0n` without a `feePolicy`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="estimatedDurationMs" type="number">
+  15 seconds for a same-chain send; the plan's `etaSeconds.max` for a bridge.
+</ResponseField>
+
+<ResponseField name="plan" type="RoutePlan">
+  Present on bridge quotes.
+</ResponseField>
+
+The `subunits` object's type is not exported by name; use `Quote["subunits"]`.
+
+## Fees
+
+<ResponseField
+  name="FeePolicy"
+  type="{ value?: string; bps?: number; recipient: string }"
+>
+  A merchant fee on top of every transfer, split 90/10 with the Whisk treasury.
+  `bps` is ignored. See [createWhisk](/reference/core/create-whisk).
+</ResponseField>
+
+<ResponseField name="FeeBearer" type={'"sender" | "receiver"'}>
+  Who absorbs Circle's fees on a bridge.
+</ResponseField>
+
+<ResponseField name="DEFAULT_FEE_BEARER" type="FeeBearer">
+  `"sender"`.
+</ResponseField>
+
+<ResponseField
+  name="FeeEntryKind"
+  type={'"custom" | "protocol" | "gas" | "forwarder" | "provider"'}
+>
+  The engine emits `"custom"` (merchant and treasury shares), `"protocol"`
+  (Circle's burn fee, buffer included) and `"forwarder"`. `"gas"` and
+  `"provider"` exist in the type but are not produced in 0.3.
+</ResponseField>
+
+<ResponseField name="FeeEntry" type="object">
+  <Expandable title="FeeEntry">
+    <ResponseField name="kind" type="FeeEntryKind" required>
+      What the fee is for.
+    </ResponseField>
+    <ResponseField name="amount" type="string" required>
+      Decimal amount.
+    </ResponseField>
+    <ResponseField name="token" type={'Token | "NATIVE"'} required>
+      The token it is paid in.
+    </ResponseField>
+    <ResponseField name="recipient" type="string">
+      Who gets it, for custom entries.
+    </ResponseField>
+    <ResponseField name="description" type="string">
+      Display text, such as `"Merchant fee (90%)"` or `"CCTP protocol fee, at
+      most"`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField
+  name="FeeBreakdown"
+  type="{ total: string; token: Token; entries: FeeEntry[] }"
+>
+  `total` sums the entries in `token` only.
+</ResponseField>
+
+```ts
+import {
+  BPS_DENOMINATOR,
+  buildCustomFeeEntries,
+  splitCustomFee,
+  sumFees,
+  sumForwarderFees,
+  sumProtocolFees,
+  WHISK_TREASURY_ADDRESS,
+  WHISK_TREASURY_BPS,
+  type CustomFeeSplit,
+} from "@usewhisk/core";
+
+const entries = buildCustomFeeEntries(
+  { value: "1", recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1" },
+  "USDC",
+);
+const breakdown = sumFees(entries, "USDC");
+const split: CustomFeeSplit = splitCustomFee(1_000_000n);
+```
+
+| Export                   | Signature                                                      | Notes                                                                                                     |
+| ------------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `buildCustomFeeEntries`  | `(policy: FeePolicy \| undefined, token: Token) => FeeEntry[]` | The two `"custom"` entries for a policy, or none.                                                         |
+| `sumFees`                | `(entries: FeeEntry[], token: Token) => FeeBreakdown`          | Entries in other tokens stay in `entries` but not in `total`. Throws `ConfigError` on a malformed amount. |
+| `sumProtocolFees`        | `(entries: FeeEntry[], token: Token) => bigint`                | Subunits of the `provider`, `forwarder` and `protocol` entries: the fees taken out of the bridged amount. |
+| `sumForwarderFees`       | `(entries: FeeEntry[], token: Token) => bigint`                | Subunits of the `forwarder` entries.                                                                      |
+| `splitCustomFee`         | `(total: bigint) => CustomFeeSplit`                            | `{ merchant, whisk }` in subunits. The treasury gets 10% rounded down; the merchant gets the rest.        |
+| `WHISK_TREASURY_ADDRESS` | `` `0x${string}` ``                                            | `0x404b07e55c6a4F1eA10e94e3d9404b7685E18238`, the same on every EVM chain.                                |
+| `WHISK_TREASURY_BPS`     | `bigint`                                                       | `1000n` (10%).                                                                                            |
+| `BPS_DENOMINATOR`        | `bigint`                                                       | `10000n`.                                                                                                 |
+
+## Steps
+
+<ResponseField
+  name="StepName"
+  type={'"approve" | "transfer" | "burn" | "fetchAttestation" | "mint"'}
+>
+  `approve`: USDC allowance for the burn (`noop` when none is needed).
+  `transfer`: same-chain transfer. `burn`: CCTP burn on the source.
+  `fetchAttestation`: waiting for Circle. `mint`: destination mint, by a wallet
+  or Circle's forwarder.
+</ResponseField>
+
+<ResponseField
+  name="StepState"
+  type={'"pending" | "success" | "error" | "noop"'}
+>
+  `noop` means the step was not needed.
+</ResponseField>
+
+<ResponseField name="Step" type="object">
+  <Expandable title="Step">
+    <ResponseField name="name" type="StepName" required>
+      Which step.
+    </ResponseField>
+    <ResponseField name="state" type="StepState" required>
+      Its state.
+    </ResponseField>
+    <ResponseField name="txHash" type="string">
+      The transaction, once submitted.
+    </ResponseField>
+    <ResponseField name="explorerUrl" type="string">
+      Set by `deriveReceiptView`.
+    </ResponseField>
+    <ResponseField name="errorMessage" type="string">
+      Set on the failed step.
+    </ResponseField>
+    <ResponseField name="errorCategory" type="WhiskErrorCategory">
+      Set on the failed step when the error has a category.
+    </ResponseField>
+    <ResponseField name="forwarded" type="boolean">
+      On `mint`: `true` when Circle's forwarder submitted it.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## SendResult
+
+`send`, `resume`, `resumeFromTx` and `refund` resolve to a `SendResult`. `RefundResult` is the same type.
+
+<ResponseField name="SendSuccess" type="object">
+  <Expandable title="SendSuccess">
+    <ResponseField name="kind" type={'"success"'} required>
+      Discriminant.
+    </ResponseField>
+    <ResponseField name="finalTxHash" type="string">
+      The mint (bridge) or transfer (send) hash, when known. Can be missing on a
+      resumed transfer the destination had already received.
+    </ResponseField>
+    <ResponseField name="steps" type="Step[]" required>
+      Every step and its final state.
+    </ResponseField>
+    <ResponseField name="customFee" type="CustomFeeOutcome">
+      Whether the payer paid the `feePolicy` fee. Set whenever a fee policy
+      charged this transfer, which happens on EVM sources only.
+    </ResponseField>
+    <ResponseField name="metadata" type="WhiskMetadata">
+      Config defaults merged with per-call metadata. Missing when neither was
+      set.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="SendFailure" type="object">
+  <Expandable title="SendFailure">
+    <ResponseField name="kind" type={'"failure"'} required>
+      Discriminant.
+    </ResponseField>
+    <ResponseField name="error" type="WhiskError" required>
+      What went wrong. See [Errors](/reference/core/errors).
+    </ResponseField>
+    <ResponseField name="steps" type="Step[]" required>
+      The failed step has `state: "error"`. A successful `burn` step means USDC
+      is in flight.
+    </ResponseField>
+    <ResponseField name="raw" type="unknown">
+      The executor's recovery snapshot (domains, burn hash, message and
+      attestation when known). Not set by `resume`.
+    </ResponseField>
+    <ResponseField name="customFee" type="CustomFeeOutcome">
+      As on success. A failure before the burn or transfer landed reports
+      `unpaid` with no `error`: the fee was never asked for.
+    </ResponseField>
+    <ResponseField name="metadata" type="WhiskMetadata">
+      As on success.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="CustomFeeOutcome" type="object">
+  Whether the payer paid the `feePolicy` fee. Branch on `status`. `amount` is the
+  whole fee in USDC, as a decimal string.
+
+  <Expandable title="CustomFeeOutcome">
+    <ResponseField name="status" type={'"paid" | "unpaid"'} required>
+      `paid` once every fee share landed, in the batch with the burn or after it.
+    </ResponseField>
+    <ResponseField name="amount" type="string" required>
+      The whole fee, such as `"0.25"`.
+    </ResponseField>
+    <ResponseField name="txHashes" type="`0x${string}`[]">
+      Required when `paid`: the fee's transactions, or the one hash of an atomic
+      batch that shares it. When `unpaid`, the shares that landed before the
+      payer stopped, if any.
+    </ResponseField>
+    <ResponseField name="error" type="WhiskError">
+      `unpaid` only. Why the fee was not paid after the transfer landed, such as
+      a `UserRejectedError` or an `OnchainRevertError`. Missing when the fee was
+      never asked for.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+```ts
+import type { CustomFeeOutcome } from "@usewhisk/core";
+
+export function describeFee(fee: CustomFeeOutcome | undefined): string {
+  if (!fee) return "No merchant fee.";
+  if (fee.status === "paid") return `Fee of ${fee.amount} USDC paid.`;
+  return fee.error
+    ? `Fee of ${fee.amount} USDC not paid: ${fee.error.message}`
+    : `Fee of ${fee.amount} USDC not charged.`;
+}
+```
+
+`CustomFeeOutcome` is exported from `@usewhisk/core` only. From `@usewhisk/react`, name it as `NonNullable<SendSuccess["customFee"]>`.
+
+The parameter and option types of the engine methods (`QuoteParams`, `SendParams`, `SendListeners`, `SendStepListener`, `MaxSendable`, `ResumeOptions`, `ResumeFromTxParams`, `RefundParams`) are documented with their methods on [Engine](/reference/core/engine). `SendStepListener` is `(step: Step) => void`.
+
+## Inflight records
+
+```ts
+import {
+  createMemoryInflightStore,
+  createStorageInflightStore,
+  type InflightRecord,
+  type InflightStore,
+} from "@usewhisk/core";
+
+const memory: InflightStore = createMemoryInflightStore();
+const persistent: InflightStore = createStorageInflightStore(
+  window.sessionStorage,
+);
+
+const pending: readonly InflightRecord[] = await persistent.list();
+for (const record of pending) await memory.put(record);
+```
+
+<ResponseField name="InflightStore" type="interface">
+  `put(record): Promise<void>`, `list(): Promise<readonly InflightRecord[]>`, `remove(id): Promise<void>`. The engine never removes a burned record by itself.
+</ResponseField>
+
+<ResponseField name="createMemoryInflightStore" type="() => InflightStore">
+  The engine's default. Lasts as long as the engine.
+</ResponseField>
+
+<ResponseField name="createStorageInflightStore" type="(storage: InflightStorage) => InflightStore">
+  Keeps each record as JSON under `whisk:inflight:<id>`. Lists only valid version 2 records, oldest first, and leaves other keys alone. `InflightStorage` is the `getItem`, `setItem`, `removeItem`, `key` and `length` part of the Web Storage API.
+</ResponseField>
+
+<ResponseField
+  name="InflightStep"
+  type={'"signing" | "burned" | "attested" | "minted"'}
+>
+  `signing` is written before the wallet is asked, `burned` when the burn hash
+  comes back, `attested` after Circle signs, `minted` once the recipient has the
+  USDC.
+</ResponseField>
+
+<ResponseField name="InflightRecord" type="object">
+  JSON-safe. Amounts are subunit strings.
+
+  <Expandable title="InflightRecord">
+    <ResponseField name="version" type="2" required>Record format.</ResponseField>
+    <ResponseField name="id" type="string" required>The quote id, or `tx:<chain>:<hash>` for a record built by `resumeFromTx`.</ResponseField>
+    <ResponseField name="network" type="ChainNetwork" required>From the source chain.</ResponseField>
+    <ResponseField name="sourceChain" type="Chain" required>Where the burn happened.</ResponseField>
+    <ResponseField name="destinationChain" type="Chain" required>Where the mint goes.</ResponseField>
+    <ResponseField name="mint" type={'"forwarder" | "adapter"'} required>Who submits the mint.</ResponseField>
+    <ResponseField name="speed" type={'"fast" | "standard"'} required>The attestation speed.</ResponseField>
+    <ResponseField name="amountBurned" type="string" required>Burned amount in 6-decimal subunits, as in the CCTP message.</ResponseField>
+    <ResponseField name="recipient" type="string" required>The recipient address (for a record built from a hash, the 32-byte mint recipient from the message).</ResponseField>
+    <ResponseField name="step" type="InflightStep" required>How far it got.</ResponseField>
+    <ResponseField name="sourceTxHash" type="string">The burn hash. Missing while `step` is `signing`.</ResponseField>
+    <ResponseField name="mintTxHash" type="string">The mint hash, when known.</ResponseField>
+    <ResponseField name="customFee" type={'{ amount: string; status: "paid" | "unpaid"; txHashes?: string[] }'}>The `feePolicy` fee this transfer carried, in subunits, and how far it got. A resumed transfer reports it and never asks for it again.</ResponseField>
+    <ResponseField name="createdAt" type="number" required>Milliseconds since the epoch.</ResponseField>
+    <ResponseField name="updatedAt" type="number" required>Milliseconds since the epoch.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Widget state
+
+A reducer for building your own send flow. `@usewhisk/react` components do not use it in 0.3.
+
+<ResponseField name="WhiskState" type="union">
+  `{ kind: "disconnected" }`, `{ kind: "idle" }`, `{ kind: "resolving"; input }`, `{ kind: "resolved"; recipient }`, `{ kind: "quoting"; recipient; amount }`, `{ kind: "review"; quote }`, `{ kind: "sending"; quote; steps; currentStep }`, `{ kind: "succeeded"; quote; steps; finalTxHash? }`, `{ kind: "failed"; error; quote?; steps?; raw? }`. `WhiskStateKind` is the union of the `kind`s.
+</ResponseField>
+
+<ResponseField name="WhiskAction" type="union">
+  `CONNECTED`, `DISCONNECTED`, `RESET`, `RESOLVE_START`, `RESOLVE_SUCCESS`, `RESOLVE_FAILURE`, `QUOTE_START`, `QUOTE_SUCCESS`, `QUOTE_FAILURE`, `REVIEW_BACK`, `SEND_START`, `STEP_UPDATE`, `SEND_SUCCESS`, `SEND_FAILURE`, `RETRY_START`, `HYDRATE_FAILED`, each as `{ type, ...payload }`.
+</ResponseField>
+
+| Export         | Signature                                                | Notes                                                                                                        |
+| -------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `reduce`       | `(state: WhiskState, action: WhiskAction) => WhiskState` | An action that does not fit the current state returns the state unchanged.                                   |
+| `initialState` | `WhiskState`                                             | `{ kind: "disconnected" }`.                                                                                  |
+| `initialSteps` | `(routeKind: "send" \| "bridge") => Step[]`              | `approve`, `transfer` for a send; `approve`, `burn`, `fetchAttestation`, `mint` for a bridge; all `pending`. |
+
+```ts
+import {
+  initialState,
+  initialSteps,
+  reduce,
+  type WhiskState,
+} from "@usewhisk/core";
+
+let state: WhiskState = initialState;
+state = reduce(state, { type: "CONNECTED" });
+console.log(state.kind, initialSteps("bridge"));
+```
+
+## Metadata
+
+<ResponseField
+  name="WhiskMetadata"
+  type="Record<string, string | number | boolean>"
+>
+  Correlation data such as order ids. Flat, at most 1024 bytes as UTF-8 JSON, no
+  keys starting with `__`. It passes through the payer's browser: keep personal
+  data and credentials out. See [Metadata](/flows/metadata).
+</ResponseField>
+
+| Export                     | Signature                                                                           | Notes                                                                                                                                           |
+| -------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `validateMetadata`         | `(input: unknown) => asserts input is WhiskMetadata`                                | Throws `ConfigError` for a non-object, an empty key, a `__` key, a nested or non-finite value, or more than 1024 bytes. An empty object passes. |
+| `mergeMetadata`            | `(defaults?: WhiskMetadata, perCall?: WhiskMetadata) => WhiskMetadata \| undefined` | Per-call keys win. `undefined` when both are empty.                                                                                             |
+| `METADATA_MAX_BYTES`       | `1024`                                                                              |                                                                                                                                                 |
+| `METADATA_RESERVED_PREFIX` | `"__"`                                                                              |                                                                                                                                                 |
+
+## Refunds
+
+<ResponseField name="RefundInput" type="object">
+  `originalTxHash`, `originalDestinationChain`, `refundDestinationChain`,
+  `originalSenderAddress`, `amount`, `reason?`, `metadata?`. Field meanings are
+  on [engine.refund](/reference/core/engine#refund).
+</ResponseField>
+
+<ResponseField name="RefundPlan" type="object">
+  The checked input: the same fields with the hash and address trimmed, and
+  `reason` and `metadata` always present (possibly `undefined`).
+</ResponseField>
+
+| Export                | Signature                                                                                                              | Notes                                                                                                                                                                                                     |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `validateRefundInput` | `(input: RefundInput) => RefundPlan`                                                                                   | Throws `ConfigError` unless the hash and address are non-empty, `amount` is a positive decimal, `reason` is at most 256 characters and `metadata` is valid. Chains are checked when the refund is quoted. |
+| `buildRefundMetadata` | `(originalTxHash: string, reason: string \| undefined, merchantMetadata: WhiskMetadata \| undefined) => WhiskMetadata` | Adds the reserved keys over the merchant's. Does not merge config defaults.                                                                                                                               |
+| `REFUND_OF_TX_KEY`    | `"__refundOfTxHash"`                                                                                                   |                                                                                                                                                                                                           |
+| `REFUND_REASON_KEY`   | `"__refundReason"`                                                                                                     |                                                                                                                                                                                                           |
+
+```ts
+import {
+  buildRefundMetadata,
+  mergeMetadata,
+  REFUND_OF_TX_KEY,
+  validateMetadata,
+  validateRefundInput,
+} from "@usewhisk/core";
+
+const input: unknown = JSON.parse('{"orderId":"A-1001"}');
+validateMetadata(input);
+const merged = mergeMetadata({ store: "eu" }, input);
+const plan = validateRefundInput({
+  originalTxHash: "0xabc",
+  originalDestinationChain: "Arc",
+  refundDestinationChain: "Base",
+  originalSenderAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  amount: "5",
+});
+const tagged = buildRefundMetadata(plan.originalTxHash, "Cancelled", merged);
+console.log(tagged[REFUND_OF_TX_KEY]);
+```
+
+## Receipts
+
+Derive a transfer's status from its hash without running the engine. `useReceipt` and `<WhiskReceipt>` are built on these.
+
+```ts
+import {
+  deriveReceiptView,
+  describeReceiptChains,
+  RECEIPT_STAGE_HELP,
+  RECEIPT_STAGE_LABELS,
+  type ReceiptInput,
+} from "@usewhisk/core";
+
+const input: ReceiptInput = {
+  sourceChain: "Base_Sepolia",
+  sourceTxHash:
+    "0x5f2c9a1e7b3d4c6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f",
+  destinationChain: "Arc_Testnet",
+  irisStatus: "pending_confirmations",
+};
+const view = deriveReceiptView(input);
+const { sourceLabel, destinationLabel } = describeReceiptChains(view, input);
+console.log(
+  `${sourceLabel} to ${destinationLabel}: ${RECEIPT_STAGE_LABELS[view.stage]}`,
+  RECEIPT_STAGE_HELP[view.stage],
+);
+```
+
+<ResponseField name="ReceiptInput" type="object">
+  `sourceChain`, `sourceTxHash`, `destinationChain` (equal to `sourceChain` for
+  a send), `destinationTxHash?`, `irisStatus?` (`undefined` before the first
+  Iris response), `hasError?` (forces `failed`).
+</ResponseField>
+
+<ResponseField
+  name="ReceiptStage"
+  type={
+    '"submitted" | "awaiting_attestation" | "attested" | "settled" | "failed"'
+  }
+>
+  `submitted`: Iris has not seen the burn. `awaiting_attestation`: Iris waits
+  for source confirmations. `attested`: attestation ready, no mint hash known.
+  `settled`: a mint hash is known, or it was a same-chain send. `failed`:
+  `hasError` was set.
+</ResponseField>
+
+<ResponseField name="ReceiptView" type="object">
+  `{ stage, steps, isCrossChain, sourceExplorerUrl, destinationExplorerUrl? }`. `steps` is a single `transfer` for a send, otherwise `burn`, `fetchAttestation`, `mint`.
+</ResponseField>
+
+| Export                  | Signature                                                                                     | Notes                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `deriveReceiptView`     | `(input: ReceiptInput) => ReceiptView`                                                        | Pure. Call again with a fresher `irisStatus`.           |
+| `describeReceiptChains` | `(view: ReceiptView, input: ReceiptInput) => { sourceLabel; destinationLabel; isCrossChain }` | Chain labels for display.                               |
+| `RECEIPT_STAGE_LABELS`  | `Record<ReceiptStage, string>`                                                                | English labels, such as `"Confirming on source chain"`. |
+| `RECEIPT_STAGE_HELP`    | `Record<ReceiptStage, string>`                                                                | One English sentence per stage.                         |
+
+## Iris
+
+A small wrapper over Circle's Iris attestation API. For the full client see [CCTP Iris](/reference/cctp/iris).
+
+```ts attestation.ts
+import {
+  buildReceiveMessageCall,
+  fetchAttestationOnce,
+  getIrisBaseUrl,
+  IRIS_SANDBOX_URL,
+  pollAttestation,
+} from "@usewhisk/core";
+
+const burnTx =
+  "0x5f2c9a1e7b3d4c6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f";
+
+const once = await fetchAttestationOnce("Base_Sepolia", burnTx);
+const done = await pollAttestation("Base_Sepolia", burnTx, {
+  timeout: 5 * 60_000,
+  pollingInterval: 5_000,
+  onUpdate: (m) => console.log(m.status),
+});
+
+if (done.status === "complete" && done.message && done.attestation) {
+  const call = buildReceiveMessageCall(
+    "Arc_Testnet",
+    done.message,
+    done.attestation,
+  );
+  console.log(call?.address, call?.functionName, call?.args);
+}
+console.log(once.status, getIrisBaseUrl("Base_Sepolia") === IRIS_SANDBOX_URL);
+```
+
+<ResponseField
+  name="IrisStatus"
+  type={'"pending_confirmations" | "complete" | "not_found"'}
+>
+  `not_found` until Iris has seen the burn.
+</ResponseField>
+
+<ResponseField
+  name="IrisMessage"
+  type="{ status: IrisStatus; message?: string; attestation?: string; eventNonce?: string }"
+>
+  `message` and `attestation` are `0x` hex, present once complete.
+</ResponseField>
+
+<ResponseField
+  name="FetchAttestationOptions"
+  type="{ baseUrl?: string; signal?: AbortSignal; fetch?: typeof fetch }"
+>
+  `baseUrl` defaults to the Iris host for the source chain's network.
+</ResponseField>
+
+<ResponseField
+  name="PollAttestationOptions"
+  type="FetchAttestationOptions & { timeout?: number; pollingInterval?: number; onUpdate?: (msg: IrisMessage) => void }"
+>
+  `timeout` defaults to 600000 ms, `pollingInterval` to 3000 ms.
+</ResponseField>
+
+| Export                 | Signature                                                                                             | Notes                                                                                                                                                             |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fetchAttestationOnce` | `(sourceChain: Chain, burnTxHash: string, options?: FetchAttestationOptions) => Promise<IrisMessage>` | One lookup. Throws `@usewhisk/cctp` Iris errors.                                                                                                                  |
+| `pollAttestation`      | `(sourceChain: Chain, burnTxHash: string, options?: PollAttestationOptions) => Promise<IrisMessage>`  | Polls until `complete` or the timeout, then returns the latest status (it does not throw on timeout). Throws an `AbortError` `DOMException` when `signal` aborts. |
+| `getIrisBaseUrl`       | `(chain: Chain) => string`                                                                            | `IRIS_MAINNET_URL` or `IRIS_SANDBOX_URL` by the chain's network.                                                                                                  |
+| `IRIS_MAINNET_URL`     | `string`                                                                                              | `https://iris-api.circle.com`                                                                                                                                     |
+| `IRIS_SANDBOX_URL`     | `string`                                                                                              | `https://iris-api-sandbox.circle.com`, used for testnets.                                                                                                         |
+
+## Manual mint
+
+For a mint you submit yourself, for example after the forwarder reported `FAILED`. `engine.resume` does this for you; use these when you need to call the contract from your own code.
+
+<ResponseField name="ReceiveMessageCall" type="object">
+  `{ destinationChain; address; abi: typeof RECEIVE_MESSAGE_ABI; functionName: "receiveMessage"; args: [message, attestation] }`, ready for viem's `writeContract` or wagmi's `useWriteContract`.
+</ResponseField>
+
+| Export                            | Signature                                                                                       | Notes                                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `buildReceiveMessageCall`         | `(destinationChain: Chain, message: string, attestation: string) => ReceiveMessageCall \| null` | `null` for non-EVM destinations. Throws `TypeError` unless both inputs start with `0x`. |
+| `messageTransmitterAddress`       | `(chain: Chain) => string`                                                                      | The chain's `MessageTransmitterV2`.                                                     |
+| `manualMintExplorerUrl`           | `(destinationChain: Chain, txHash: string) => string \| undefined`                              | Explorer link for the mint.                                                             |
+| `RECEIVE_MESSAGE_ABI`             | ABI fragment                                                                                    | `MessageTransmitterV2.receiveMessage` only.                                             |
+| `EVM_MAINNET_MESSAGE_TRANSMITTER` | `` `0x${string}` ``                                                                             | Same address on every EVM mainnet.                                                      |
+| `EVM_TESTNET_MESSAGE_TRANSMITTER` | `` `0x${string}` ``                                                                             | Same address on every EVM testnet.                                                      |
+| `SOLANA_MESSAGE_TRANSMITTER`      | `string`                                                                                        | The Solana program id, the same on mainnet-beta and devnet. Core only.                  |
+
+## Webhook signing
+
+Server-side HMAC-SHA256 helpers for signing and verifying JSON payloads that your own servers send each other, such as a payment confirmation from your checkout backend. Whisk 0.3 does not send webhooks itself. They use Web Crypto, so they run on Node 18+, Deno, Bun and edge runtimes. Never ship the secret to a browser.
+
+```ts webhook.ts
+import { verifyWebhook, signWebhook } from "@usewhisk/core";
+
+declare const secret: string;
+
+const signed = await signWebhook({ orderId: "A-1001", status: "paid" }, secret);
+await fetch("https://merchant.example.com/hooks/whisk", {
+  method: "POST",
+  headers: signed.headers,
+  body: signed.body,
+});
+
+export async function handle(request: Request): Promise<Response> {
+  const rawBody = await request.text();
+  const verified = await verifyWebhook<{ orderId: string }>(
+    rawBody,
+    Object.fromEntries(request.headers),
+    secret,
+  );
+  if (!verified.ok) return new Response(verified.reason, { status: 401 });
+  return new Response(verified.payload.orderId);
+}
+```
+
+| Export                           | Signature                                                                                                                                                           | Notes                                                                                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signWebhook`                    | `<T>(payload: T, secret: string, options?: SignWebhookOptions) => Promise<SignWebhookResult>`                                                                       | Wraps the payload in a `WebhookEnvelope` and signs `` `${timestamp}.${body}` ``. Throws `ConfigError` for an empty secret or without Web Crypto.    |
+| `verifyWebhook`                  | `<T>(rawBody: string, headers: Record<string, string \| string[] \| undefined>, secret: string, options?: VerifyWebhookOptions) => Promise<WebhookVerifyResult<T>>` | Pass the raw body before JSON parsing. Header lookup ignores case. Returns `{ ok: false, reason }` instead of throwing, except for an empty secret. |
+| `WHISK_SIGNATURE_HEADER`         | `"x-whisk-signature"`                                                                                                                                               | Hex HMAC.                                                                                                                                           |
+| `WHISK_TIMESTAMP_HEADER`         | `"x-whisk-timestamp"`                                                                                                                                               | Milliseconds since the epoch.                                                                                                                       |
+| `WHISK_WEBHOOK_VERSION`          | `"v1"`                                                                                                                                                              |                                                                                                                                                     |
+| `DEFAULT_TIMESTAMP_TOLERANCE_MS` | `300000`                                                                                                                                                            | Allowed clock skew (5 minutes).                                                                                                                     |
+
+<ResponseField
+  name="WebhookEnvelope<T>"
+  type="{ version: 'v1'; timestamp: number; payload: T }"
+>
+  The signed JSON body.
+</ResponseField>
+
+<ResponseField name="SignWebhookOptions" type="{ timestamp?: number }">
+  Fixed timestamp, for tests.
+</ResponseField>
+
+<ResponseField
+  name="SignWebhookResult"
+  type="{ body: string; signature: string; timestamp: number; headers: Record<string, string> }"
+>
+  POST `body` byte for byte with `headers` (content type, signature and
+  timestamp).
+</ResponseField>
+
+<ResponseField
+  name="VerifyWebhookOptions"
+  type="{ toleranceMs?: number; now?: number }"
+>
+  `toleranceMs` defaults to `DEFAULT_TIMESTAMP_TOLERANCE_MS`. `now` is for
+  tests.
+</ResponseField>
+
+<ResponseField
+  name="WebhookVerifyResult<T>"
+  type="{ ok: true; envelope: WebhookEnvelope<T>; payload: T } | { ok: false; reason: WebhookVerifyError }"
+>
+  The verification outcome.
+</ResponseField>
+
+<ResponseField name="WebhookVerifyError" type="string union">
+  `"missing_signature"`, `"missing_timestamp"`, `"malformed_body"`,
+  `"malformed_envelope"`, `"unsupported_version"`, `"timestamp_out_of_range"`,
+  `"signature_mismatch"`. Safe to show.
+</ResponseField>
+
+## Config
+
+`WhiskConfig` is documented on [createWhisk](/reference/core/create-whisk). The error types are on [Errors](/reference/core/errors).

@@ -1,0 +1,372 @@
+---
+title: Checkout
+description: Take a fixed-price USDC payment for an order and confirm it on your server before you fulfil.
+---
+
+A checkout locks three things the payer must not change: who gets paid, how
+much, and on which chain. Lock them on `<WhiskSend>` and report the result to
+your server:
+
+```tsx PayForOrder.tsx
+import { useState } from "react";
+import { WhiskSend, type SendSuccess } from "@usewhisk/react";
+
+const MERCHANT_ADDRESS = "0x5B8ecaB7096F8aBED873D246629ef9f05f467605";
+
+export function PayForOrder({
+  orderId,
+  total,
+}: {
+  orderId: string;
+  total: string;
+}) {
+  const [error, setError] = useState<string | null>(null);
+
+  function onSuccess(result: SendSuccess) {
+    const burn = result.steps.find((step) => step.name === "burn");
+    fetch(`/api/orders/${orderId}/paid`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        finalTxHash: result.finalTxHash,
+        burnTxHash: burn?.txHash,
+      }),
+    }).catch(() => setError("Paid, but we could not reach the store."));
+  }
+
+  return (
+    <>
+      <WhiskSend
+        tabs={["bridge"]}
+        title={`Order ${orderId}`}
+        amount={total}
+        recipient={MERCHANT_ADDRESS}
+        destinationChain="Base_Sepolia"
+        onSuccess={onSuccess}
+      />
+      {error && <p role="alert">{error}</p>}
+    </>
+  );
+}
+```
+
+The component must sit inside a [`<WhiskProvider>`](/widget/whisk-provider).
+`total` is a decimal USDC string such as `"42.50"`, the same string the payer
+sees in the amount field.
+
+## Lock the order
+
+`amount`, `recipient`, `sourceChain` and `destinationChain` are controlled
+props: when you pass one, the field shows that value and ignores edits. The
+`default*` versions only seed a field the payer can still change, so never use
+them for a price or a merchant address.
+
+Pick one of two shapes:
+
+| Shape       | Props                                                                         | What happens                                                              |
+| ----------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Cross-chain | `tabs={["bridge"]}`, `destinationChain`                                       | The payer picks any source chain on the same network; you receive on one. |
+| Same chain  | `tabs={["send"]}`, `sourceChain` and `destinationChain` set to the same chain | A plain USDC transfer on one chain, no CCTP, no bridge fees.              |
+
+<Warning>
+  On the Send tab the destination is whatever source chain the payer picked. If
+  you leave both tabs visible and only lock `destinationChain`, a payer on the
+  Send tab pays your address on their own chain. That is only safe when your
+  address can receive on every chain in the config (a contract wallet deployed
+  on one chain cannot).
+</Warning>
+
+The network (mainnet or testnet) follows the source chain. A bridge never
+crosses networks: quoting a mainnet source against a testnet destination
+throws `NetworkMismatchError` before anything is signed.
+
+## What the merchant receives
+
+Who pays the bridge fees is set once, on the config, with `feeBearer`. There is
+no per-widget override.
+
+```ts
+import { createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Arc_Testnet", "Base_Sepolia", "Ethereum_Sepolia"],
+  feeBearer: "sender",
+});
+```
+
+| `feeBearer`          | Payer is debited                          | Merchant receives                            |
+| -------------------- | ----------------------------------------- | -------------------------------------------- |
+| `"sender"` (default) | `amount` plus the CCTP and Forwarder fees | at least `amount`                            |
+| `"receiver"`         | `amount`                                  | `amount` less the fees, at least `amountOut` |
+
+For a checkout keep the default. The burn is sized up so the merchant nets the
+full price, and the quote shows the payer the total as "You pay"
+(`quote.amountIn`). With `"receiver"`, a 42.50 order arrives short by the
+bridge fees, and a total too small to cover them fails to quote.
+
+A same-chain transfer has no CCTP fees, so `feeBearer` does not apply: the
+merchant receives exactly `amount`. A `feePolicy` merchant fee is always paid by
+the payer on top, whatever `feeBearer` says. See
+[quotes and fees](/concepts/quotes-and-fees) for the fee lines.
+
+## Confirm the payment
+
+`onSuccess` receives a `SendSuccess`:
+
+<ResponseField name="finalTxHash" type="string | undefined">
+  The transaction that put the USDC in the merchant's wallet. For a same-chain
+  send it is the transfer on that chain. For a bridge it is the mint on the
+  destination chain. It can be missing when Circle's Forwarder minted and Iris
+  did not return the mint hash.
+</ResponseField>
+
+<ResponseField name="steps" type="Step[]">
+  Every step with its state and tx hash. The `burn` step's `txHash` is the
+  source-chain burn, which is what [receipts](/flows/receipts) and
+  `resumeFromTx` take.
+</ResponseField>
+
+<ResponseField name="metadata" type="WhiskMetadata | undefined">
+  The metadata passed to `send`, merged with config defaults. `<WhiskSend>` has
+  no `metadata` prop, so through the widget this is always undefined.
+</ResponseField>
+
+<ResponseField name="customFee" type="CustomFeeOutcome | undefined">
+  Set when a `feePolicy` charged the payer, on EVM sources. `status: "paid"`
+  means the fee landed; `"unpaid"` means the payment went through but the payer
+  rejected the fee request, or it reverted. A wallet without atomic batches asks
+  for the fee after the payment, so the payer can decline it. If your fee is
+  part of the price, check this before you fulfil. See [when the fee is
+  paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+</ResponseField>
+
+`onFailure` receives a `SendFailure` with `error` and `steps`. If the `burn`
+step succeeded, the payer's USDC has left their wallet and is in flight. Do
+not tell them the payment failed: show a [`<WhiskReceipt>`](/widget/whisk-receipt)
+or the [`<ResumeList>`](/widget/resume-list) so they can finish the mint. See
+[recovery](/concepts/recovery).
+
+## Attach order metadata
+
+To tag the payment with your order id, build the flow with
+[`useWhisk`](/hooks/use-whisk) and pass `metadata` to `send`. The hook signs
+with the connected EVM wallet.
+
+```tsx Checkout.tsx
+import { useState } from "react";
+import {
+  QuoteChangedError,
+  QuoteExpiredError,
+  toWhiskError,
+  useWhisk,
+  type Quote,
+} from "@usewhisk/react";
+import { reportBurn, reportPaid } from "./api";
+
+const MERCHANT_ADDRESS = "0x5B8ecaB7096F8aBED873D246629ef9f05f467605";
+
+export function Checkout({
+  orderId,
+  total,
+}: {
+  orderId: string;
+  total: string;
+}) {
+  const { quote, send, isConnected, isSending } = useWhisk();
+  const [pending, setPending] = useState<Quote | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function review() {
+    setError(null);
+    try {
+      setPending(
+        await quote({
+          sourceChain: "Arc_Testnet",
+          destinationChain: "Base_Sepolia",
+          recipient: { address: MERCHANT_ADDRESS, chain: "Base_Sepolia" },
+          amount: total,
+        }),
+      );
+    } catch (err) {
+      setError(toWhiskError(err, "Could not price this order.").message);
+    }
+  }
+
+  async function pay(confirmed: Quote) {
+    setError(null);
+    try {
+      const result = await send(
+        { quote: confirmed, metadata: { orderId, source: "checkout" } },
+        {
+          onBurnSubmitted: (txHash) => {
+            reportBurn(orderId, txHash).catch(console.error);
+          },
+        },
+      );
+      if (result.kind === "success") await reportPaid(orderId, result);
+      else setError(result.error.message);
+    } catch (err) {
+      if (err instanceof QuoteChangedError) setPending(err.quote);
+      if (err instanceof QuoteExpiredError) setPending(null);
+      setError(toWhiskError(err, "The payment did not go through.").message);
+    }
+  }
+
+  if (!isConnected) return <p>Connect a wallet to pay.</p>;
+
+  return (
+    <div>
+      {pending ? (
+        <button disabled={isSending} onClick={() => pay(pending)}>
+          Pay {pending.amountIn} USDC
+        </button>
+      ) : (
+        <button onClick={review}>Review payment</button>
+      )}
+      {error && <p role="alert">{error}</p>}
+    </div>
+  );
+}
+```
+
+A few things this does that the widget does for you:
+
+- The payer sees `quote.amountIn` before signing. `send` signs exactly that
+  quote.
+- A quote expires after about a minute. `send` throws `QuoteExpiredError` for
+  a stale one and `QuoteChangedError` when Circle's fees rose past it;
+  `err.quote` is the fresh quote to show.
+- `onBurnSubmitted` fires with the burn hash before any receipt wait. Saving it
+  against the order there means a closed tab mid-bridge still leaves you a hash
+  to look up.
+
+<Note>
+  Metadata stays in the browser. It is not written on chain, not sent to Circle,
+  not kept in the in-flight record, and Whisk has no server that receives it. It
+  comes back on the `SendResult` so your own code can tell which order a result
+  belongs to. See [metadata](/flows/metadata).
+</Note>
+
+## Verify on your server
+
+Everything the browser posts is a claim. A payer can call your endpoint with
+any hash, replay one from an earlier order, or pay on testnet and claim
+mainnet. Whisk 0.3 does not notify your server, so your server checks the
+chain itself before it fulfils.
+
+Take the chain, merchant address and amount from your order record, never from
+the request, then read the transaction:
+
+```ts verify-payment.ts
+import {
+  createPublicClient,
+  erc20Abi,
+  http,
+  isAddressEqual,
+  parseEventLogs,
+  type Address,
+  type Hash,
+} from "viem";
+import { getChain, parseUsdcAmount, type Chain } from "@usewhisk/core";
+
+export type ExpectedPayment = {
+  chain: Chain;
+  merchant: Address;
+  amount: string;
+};
+
+export async function verifyPayment(
+  expected: ExpectedPayment,
+  txHash: Hash,
+): Promise<boolean> {
+  const chain = getChain(expected.chain);
+  if (chain.ecosystem !== "evm") {
+    throw new Error(`${chain.label} is not an EVM chain`);
+  }
+  const client = createPublicClient({
+    transport: http(chain.defaultRpcUrls[0]),
+  });
+  const receipt = await client.waitForTransactionReceipt({
+    hash: txHash,
+    confirmations: 2,
+  });
+  if (receipt.status !== "success") return false;
+
+  const received = parseEventLogs({
+    abi: erc20Abi,
+    eventName: "Transfer",
+    logs: receipt.logs,
+  })
+    .filter(
+      (log) =>
+        isAddressEqual(log.address, chain.usdc) &&
+        isAddressEqual(log.args.to, expected.merchant),
+    )
+    .reduce((sum, log) => sum + log.args.value, 0n);
+
+  return received >= parseUsdcAmount(expected.amount);
+}
+```
+
+This works for both shapes. A same-chain payment is a USDC `Transfer` from the
+payer to the merchant; a bridge mint is a `Transfer` from the zero address to
+the merchant. In both, the amount is compared in 6-decimal `bigint` subunits.
+Use your own RPC in production rather than the chain's public default.
+
+The route handler then refuses anything it cannot prove and flips the order
+once:
+
+```ts route.ts
+import type { Hash } from "viem";
+import { verifyPayment, type ExpectedPayment } from "./verify-payment";
+
+type Order = ExpectedPayment & { id: string; status: "pending" | "paid" };
+
+declare const db: {
+  findOrder(id: string): Promise<Order | null>;
+  isTxUsed(txHash: string): Promise<boolean>;
+  markPaid(id: string, txHash: string): Promise<boolean>;
+};
+
+export async function POST(req: Request, orderId: string) {
+  const { finalTxHash } = (await req.json()) as { finalTxHash?: Hash };
+  const order = await db.findOrder(orderId);
+  if (!order || order.status !== "pending" || !finalTxHash) {
+    return Response.json({ ok: false }, { status: 400 });
+  }
+  if (await db.isTxUsed(finalTxHash)) {
+    return Response.json({ ok: false }, { status: 409 });
+  }
+  if (!(await verifyPayment(order, finalTxHash))) {
+    return Response.json({ ok: false }, { status: 402 });
+  }
+  const first = await db.markPaid(order.id, finalTxHash);
+  return Response.json({ ok: true, fulfilled: first });
+}
+```
+
+- `isTxUsed` stops one payment from settling two orders. Store the hash with a
+  unique index.
+- `markPaid` should be a conditional update (`where status = 'pending'`) so two
+  concurrent requests cannot both fulfil.
+- When `finalTxHash` is missing (a forwarded mint whose hash Iris did not
+  return), keep the order pending with its burn hash and match it later
+  against USDC `Transfer` logs to the merchant on the destination chain.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Receipts" href="/flows/receipts">
+    Show settlement status from a burn hash.
+  </Card>
+  <Card title="Refunds" href="/flows/refunds">
+    Send a payment back to the payer.
+  </Card>
+  <Card title="E-commerce recipe" href="/recipes/ecommerce-checkout">
+    A full shop, cart and checkout example.
+  </Card>
+  <Card title="Fund safety" href="/concepts/fund-safety">
+    What Whisk checks before it burns.
+  </Card>
+</CardGroup>

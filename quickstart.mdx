@@ -1,0 +1,187 @@
+---
+title: "Quickstart"
+description: "Add a working USDC send and bridge widget to a React app, on testnet first."
+---
+
+This page takes a React app to a working widget that sends USDC on Base Sepolia and bridges it to Arc Testnet. The finished code is two files:
+
+```tsx App.tsx
+import { WhiskProvider, WhiskSend } from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+import { config } from "./whisk";
+
+export default function App() {
+  return (
+    <WhiskProvider config={config}>
+      <WhiskSend
+        onSuccess={(result) => console.log("settled", result.finalTxHash)}
+        onFailure={(result) =>
+          console.error(result.error.code, result.error.message)
+        }
+      />
+    </WhiskProvider>
+  );
+}
+```
+
+```ts whisk.ts
+import { createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    evm({
+      chains: ["Base_Sepolia", "Arc_Testnet"],
+      projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+      appName: "My Store",
+    }),
+  ],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+  defaultSourceChain: "Base_Sepolia",
+  defaultDestinationChain: "Arc_Testnet",
+});
+```
+
+## Steps
+
+<Steps>
+  <Step title="Install the packages">
+    ```bash
+    npm install @usewhisk/react @tanstack/react-query viem
+    ```
+
+    `react`, `react-dom`, `@tanstack/react-query` and `viem` (`>=2.57.5 <3`) are peer dependencies. wagmi, `@usewhisk/core` and the Solana, Stellar and Starknet wallet libraries come with `@usewhisk/react`. See [installation](/installation) for the full list.
+
+  </Step>
+  <Step title="Import the styles">
+    ```tsx
+    import "@usewhisk/react/styles.css";
+    ```
+
+    Import it once, anywhere in your app. The widget's components have no styling without it. The widget uses Inter if your page loads it and system fonts otherwise; to load Whisk's fonts too, see [fonts](/theming/fonts).
+
+  </Step>
+  <Step title="Create the config">
+    `createWhiskConfig` takes the wallet factories for the ecosystems you accept and the chains the widget offers.
+
+    ```ts whisk.ts
+    import { createWhiskConfig, evm } from "@usewhisk/react";
+
+    export const config = createWhiskConfig({
+      wallets: [
+        evm({
+          chains: ["Base_Sepolia", "Arc_Testnet"],
+          projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+          appName: "My Store",
+        }),
+      ],
+      chains: ["Base_Sepolia", "Arc_Testnet"],
+      defaultSourceChain: "Base_Sepolia",
+      defaultDestinationChain: "Arc_Testnet",
+    });
+    ```
+
+    `evm({ chains })` lists the chains the wallet can switch to. `projectId` is optional: it is your WalletConnect Cloud project ID, and without one the WalletConnect option is left out while browser wallets (such as MetaMask or Rabby) and Coinbase Wallet still work. `appName` is shown in the WalletConnect and Coinbase Wallet pairing dialogs.
+
+    `createWhiskConfig` throws a `ConfigError` if `wallets` or `chains` is empty, or if a default chain is not in `chains`. See [wallets](/wallets) for Solana, Stellar and Starknet.
+
+  </Step>
+  <Step title="Render the widget">
+    Wrap the widget in `WhiskProvider`. The provider mounts wagmi, a react-query client and each wallet ecosystem in your config, and reuses a `WagmiProvider` or `QueryClientProvider` you already have.
+
+    ```tsx App.tsx
+    import { WhiskProvider, WhiskSend } from "@usewhisk/react";
+    import "@usewhisk/react/styles.css";
+    import { config } from "./whisk";
+
+    export default function App() {
+      return (
+        <WhiskProvider config={config}>
+          <WhiskSend
+            onSuccess={(result) => console.log("settled", result.finalTxHash)}
+            onFailure={(result) => console.error(result.error.code, result.error.message)}
+          />
+        </WhiskProvider>
+      );
+    }
+    ```
+
+    `onSuccess` fires when the transfer settles, with the final transaction hash (the mint, on a bridge) and every step. `onFailure` fires when the engine returns a failure, with a typed `error`. See [errors](/concepts/errors).
+
+  </Step>
+  <Step title="Send on testnet">
+    Get test USDC from [Circle's faucet](https://faucet.circle.com) on Base Sepolia, plus a little Base Sepolia ETH for gas. Start the app, connect a wallet, and try both tabs:
+
+    - **Send** moves USDC to an address on the source chain.
+    - **Bridge** burns USDC on Base Sepolia and mints it on Arc Testnet. Base Sepolia offers Fast Transfer, so Circle attests the burn in seconds instead of waiting the 15 minutes or so for Ethereum finality. Circle's Forwarding Service submits the mint on Arc Testnet, so the payer does not need to switch wallets.
+
+    The review screen shows "You pay" and "Recipient gets" before the wallet asks for a signature. By default the payer covers the bridge fees, so the recipient gets the amount entered. See [quotes and fees](/concepts/quotes-and-fees).
+
+    Arc pays gas in USDC, so a send from Arc Testnet needs only USDC. Arc has no Fast Transfer and does not need it: its blocks are final in under a second, so a Standard burn from Arc is attested about as quickly.
+
+  </Step>
+</Steps>
+
+## Going to mainnet
+
+Change the chain ids. The network comes from the source chain, so there is no other switch:
+
+```ts whisk.ts
+import { createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    evm({
+      chains: ["Base", "Arc"],
+      projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+      appName: "My Store",
+    }),
+  ],
+  chains: ["Base", "Arc"],
+  defaultSourceChain: "Base",
+  defaultDestinationChain: "Arc",
+});
+```
+
+Before you ship, set your own RPC endpoints. The defaults are public and rate limited. See [RPC endpoints](/rpc).
+
+## Next.js App Router
+
+wagmi and the wallet libraries should not run during prerender. Put the provider and widget in a client component and load it with `next/dynamic` and `ssr: false`:
+
+```tsx app/pay-gate.tsx
+"use client";
+
+import dynamic from "next/dynamic";
+
+const Pay = dynamic(() => import("./pay"), { ssr: false });
+
+export function PayGate() {
+  return <Pay />;
+}
+```
+
+Here `./pay` is the `App` component above. Render `<PayGate />` from any server component.
+
+## Lock the fields for a checkout
+
+For an invoice or a fixed-price checkout, pass the values as props. A prop you pass locks its field; a `default*` prop fills it but leaves it editable.
+
+```tsx Checkout.tsx
+import { WhiskProvider, WhiskSend } from "@usewhisk/react";
+import { config } from "./whisk";
+
+export function Checkout() {
+  return (
+    <WhiskProvider config={config}>
+      <WhiskSend
+        tabs={["bridge"]}
+        amount="25.00"
+        recipient="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+        destinationChain="Arc_Testnet"
+      />
+    </WhiskProvider>
+  );
+}
+```
+
+Amounts are decimal USDC strings, so `"25.00"` is 25 USDC. See [WhiskSend](/widget/whisk-send) for every prop.

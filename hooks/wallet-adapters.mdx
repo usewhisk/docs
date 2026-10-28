@@ -1,0 +1,198 @@
+---
+title: Wallet adapter hooks
+sidebarTitle: Wallet adapters
+description: Turn the wallets connected through WhiskProvider into the adapters the engine signs with.
+---
+
+The engine never talks to a wallet directly. It builds calls and hands them to
+a `WhiskAdapter`, one shape per ecosystem. These hooks turn whatever the payer
+connected through `<WhiskProvider>` into that shape.
+
+```ts useQuoteFrom.ts
+import { useAdapterFor, useWhiskEngine, type Chain } from "@usewhisk/react";
+
+export function useQuoteFrom() {
+  const engine = useWhiskEngine();
+  const adapterFor = useAdapterFor();
+
+  return async function quoteFrom(
+    sourceChain: Chain,
+    destinationChain: Chain,
+    to: string,
+    amount: string,
+  ) {
+    const adapter = adapterFor(sourceChain);
+    if (!adapter) throw new Error(`Connect a wallet for ${sourceChain} first.`);
+    const destinationAdapter = adapterFor(destinationChain);
+    const recipient = await engine.resolve(to, destinationChain);
+
+    return engine.quote({
+      sourceChain,
+      destinationChain,
+      recipient,
+      amount,
+      adapter,
+      ...(destinationAdapter && { destinationAdapter }),
+    });
+  };
+}
+```
+
+`<WhiskSend>` uses them internally, so you only need them when you call the
+engine yourself: a custom UI, a headless send, a refund from a non-EVM wallet,
+or finishing a stuck transfer.
+
+## The hooks
+
+| Hook                   | Returns                                  | `null` when                                                                               |
+| ---------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `useEvmAdapter()`      | `EvmAdapter \| null`                     | No wagmi account is connected                                                             |
+| `useSolanaAdapter()`   | `SolanaAdapter \| null`                  | No Wallet Standard wallet is connected, or `solana()` is not configured                   |
+| `useStellarAdapter()`  | `StellarAdapter \| null`                 | No Stellar wallet is connected, or `stellar()` is not configured                          |
+| `useStarknetAdapter()` | `StarknetAdapter \| null`                | No Starknet wallet is connected, or `starknet()` is not configured                        |
+| `useAdapterFor()`      | `(chain: Chain) => WhiskAdapter \| null` | The returned function gives `null` when no wallet for that chain's ecosystem is connected |
+
+Each adapter is rebuilt when its wallet's account changes, so read the hook
+again rather than keeping an adapter in a ref. Every hook needs
+[`<WhiskProvider>`](/widget/whisk-provider) above it. `useEvmAdapter`, and so
+`useAdapterFor`, read wagmi and also need `evm()` in `config.wallets` or a
+`WagmiProvider` of your own.
+
+`useAdapterFor` picks by the chain's ecosystem, which is the usual way to get
+both sides of a bridge:
+
+- `adapter`: `adapterFor(sourceChain)`, the wallet that pays and signs the
+  burn.
+- `destinationAdapter`: `adapterFor(destinationChain)`, the wallet that signs
+  the mint on routes where Circle's Forwarder does not. Circle forwards burns
+  from EVM or Solana into EVM chains that support it; anything into Solana,
+  Stellar or Starknet, or out of Stellar or Starknet, needs it. Without it,
+  `quote` throws `RouteUnavailableError` with
+  `reason: "destination_adapter_required"`.
+
+## One ecosystem
+
+Use the specific hook when a component only handles one ecosystem. This one
+quotes a Solana Devnet to Base Sepolia bridge.
+
+```tsx SolanaToBase.tsx
+import { useEffect, useState } from "react";
+import { useSolanaAdapter, useWhiskEngine } from "@usewhisk/react";
+
+export function SolanaToBase({ to, amount }: { to: string; amount: string }) {
+  const engine = useWhiskEngine();
+  const solana = useSolanaAdapter();
+  const [fees, setFees] = useState<string>();
+
+  useEffect(() => {
+    if (!solana) return;
+    let cancelled = false;
+    engine
+      .resolve(to, "Base_Sepolia")
+      .then((recipient) =>
+        engine.quote({
+          sourceChain: "Solana_Devnet",
+          destinationChain: "Base_Sepolia",
+          recipient,
+          amount,
+          adapter: solana,
+        }),
+      )
+      .then((quote) => {
+        if (!cancelled) setFees(quote.fees.total);
+      })
+      .catch((err: unknown) => console.error(err));
+    return () => {
+      cancelled = true;
+    };
+  }, [engine, solana, to, amount]);
+
+  if (!solana) return <p>Connect a Solana wallet.</p>;
+  return <p>Fees: {fees ?? "..."} USDC</p>;
+}
+```
+
+`useWhisk` covers only the EVM wallet, so for a Solana, Stellar or Starknet
+source you call `engine.quote` and `engine.send` with the adapter yourself.
+Connecting those wallets is done through
+[`<ConnectModal>`](/widget/connect-modal).
+
+## What each adapter does
+
+All four come from `@usewhisk/core` and are discriminated on `kind`:
+
+```ts
+import type { WhiskAdapter } from "@usewhisk/react";
+
+export function describe(adapter: WhiskAdapter): Promise<string> {
+  switch (adapter.kind) {
+    case "evm":
+      return adapter.getChainId().then((id) => `EVM chain ${id}`);
+    case "solana":
+      return adapter.getCluster();
+    case "stellar":
+      return adapter.getNetwork();
+    case "starknet":
+      return adapter.getChainId();
+  }
+}
+```
+
+| Adapter           | `kind`       | `address`         | Signs with                                                                                                               |
+| ----------------- | ------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `EvmAdapter`      | `"evm"`      | `0x` hex          | `sendCalls(calls, options)`: one transaction per call, each waiting for the last to confirm, or one atomic batch         |
+| `SolanaAdapter`   | `"solana"`   | Base58 public key | `sendTransaction(instructions, { extraSigners })`: one transaction, partly signed by the engine's one-off keypairs first |
+| `StellarAdapter`  | `"stellar"`  | `G...` strkey     | `submitInvocation(invocations)`: one Soroban transaction per invocation, simulated, signed and polled until it lands     |
+| `StarknetAdapter` | `"starknet"` | felt252 hex       | `submitCalls(calls)`: one multicall, so approve and burn land together                                                   |
+
+Each also has a confirm method (`waitForReceipt` on EVM, `confirmTransaction`
+elsewhere) and a way to read its network: `getChainId` on EVM and Starknet,
+`getCluster` on Solana, `getNetwork` on Stellar. The engine checks the network
+before each write and, on EVM, calls `switchChain` when the wallet is on
+another chain. Wallet and RPC failures come back as `WhiskError`s, with a
+rejection in the wallet as `UserRejectedError`.
+
+The React adapters behave like this:
+
+- **EVM** (`useEvmAdapter`) sends through wagmi's `sendTransaction`. It waits
+  for two confirmations between calls, so a burn is never estimated against an
+  allowance a lagging RPC has not seen yet, and one confirmation after the
+  last. A reverted receipt throws. For a transfer that carries a merchant fee,
+  it reads wagmi's `getCapabilities` and, when the wallet supports atomic
+  EIP-5792 batches, sends the burn and the fee as one batch through wagmi's
+  `sendCalls`. On Arc, where every call carries its own gas price, the fee is
+  a separate request after the burn. See [when the fee is
+  paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+- **Solana** (`useSolanaAdapter`) builds a legacy transaction with the wallet
+  as fee payer and the latest blockhash, and confirms at `confirmed`. The
+  cluster comes from `solana({ network })`: `mainnet-beta`, otherwise
+  `devnet`.
+- **Stellar** (`useStellarAdapter`) signs through Stellar Wallets Kit and
+  waits up to 60 seconds for each transaction, so an `approve` lands before the
+  burn that spends it. Its `getTrustline` reads a recipient's USDC trustline
+  over Soroban RPC, which the engine checks before a burn into Stellar.
+- **Starknet** (`useStarknetAdapter`) calls the wallet's
+  `wallet_addInvokeTransaction` and polls the configured RPC for up to 10
+  minutes.
+
+## Outside React
+
+`createWagmiEvmAdapter(wagmiConfig, address)` is the function behind
+`useEvmAdapter`. Use it where hooks cannot run, such as an event handler in
+another store. It needs the wagmi `Config` the payer connected through, such as
+the one you pass to your own `WagmiProvider`.
+
+```ts currentEvmAdapter.ts
+import { getAccount, type Config } from "@wagmi/core";
+import { createWagmiEvmAdapter, type EvmAdapter } from "@usewhisk/react";
+
+declare const wagmiConfig: Config;
+
+export function currentEvmAdapter(): EvmAdapter | null {
+  const { address } = getAccount(wagmiConfig);
+  return address ? createWagmiEvmAdapter(wagmiConfig, address) : null;
+}
+```
+
+To write an adapter for a signer Whisk does not wrap, such as a server key or
+an injected wallet outside React, see [the core engine](/headless/core-engine).

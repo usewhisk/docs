@@ -1,0 +1,760 @@
+---
+title: Burn and mint builders
+sidebarTitle: Builders
+description: Build CCTP V2 burn and mint calls for EVM, Solana, Stellar and Starknet, plus the hook data, address encoding and chain reads around them.
+---
+
+Builders turn a transfer into the exact calls a wallet signs. They validate the input, encode it, and return plain data; nothing is sent.
+
+```ts
+import {
+  BaseSepolia,
+  ArcTestnet,
+  getBurnFees,
+  pickFeeTier,
+  buildBurnIntent,
+} from "@usewhisk/cctp";
+
+const tiers = await getBurnFees(
+  "testnet",
+  BaseSepolia.cctpDomain,
+  ArcTestnet.cctpDomain,
+);
+
+const intent = buildBurnIntent({
+  source: BaseSepolia,
+  destination: ArcTestnet,
+  amount: 10_000_000n,
+  mintRecipient: "0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e",
+  fee: { tier: pickFeeTier(tiers, "standard"), forwarderLevel: "med" },
+});
+
+console.log(intent.calls.length, intent.maxFee, intent.withForwarder);
+```
+
+| Source   | Burn builder                                              | Destination | Mint builder                 |
+| -------- | --------------------------------------------------------- | ----------- | ---------------------------- |
+| EVM      | `buildBurnIntent`, `buildBurnWithFeesIntent`              | EVM         | `buildMintIntent`            |
+| Solana   | `buildSolanaBurnIntent`                                   | Solana      | `buildSolanaReceiveIntent`   |
+| Stellar  | `buildStellarApproveInvocation`, `buildStellarBurnIntent` | Stellar     | `buildStellarMintIntent`     |
+| Starknet | `buildStarknetApproveCall`, `buildStarknetBurnIntent`     | Starknet    | `buildStarknetReceiveIntent` |
+
+Any source can burn to any destination. The burn only needs the destination's domain and the recipient as 32 bytes.
+
+<Warning>
+  The burn moves the payer's USDC out of their wallet for good. Fetch the fees,
+  check the route and validate the recipient before you ask anyone to sign it.
+  If the mint never happens, the attested message is the only way to get the
+  money out, so keep the burn transaction hash.
+</Warning>
+
+## EVM burns
+
+### `buildBurnIntent`
+
+`buildBurnIntent(input: BuildBurnIntentInput): BurnIntent`
+
+Builds an optional `approve` on the source USDC, then `depositForBurnWithHook` (forwarder on, or custom hook data) or `depositForBurn` (forwarder off) on `TokenMessengerV2`. The source must be an EVM chain. The finality threshold comes from the fee tier: 1000 for Fast, 2000 for Standard.
+
+<ParamField path="source" type="CctpChain" required>
+  The EVM chain the USDC is burned on. A non-EVM source throws
+  `UnsupportedError("unsupported_ecosystem")`.
+</ParamField>
+<ParamField path="destination" type="CctpChain" required>
+  Any chain in the registry with a different domain. The same domain throws
+  `InvalidInputError("no_route")`.
+</ParamField>
+<ParamField path="amount" type="bigint" required>
+  USDC subunits, 6 decimals. Above zero and at most 10,000,000 USDC
+  (`10_000_000_000_000n`); CCTP refuses larger burns, and this throws
+  `ProtocolError("amount_too_large")`.
+</ParamField>
+<ParamField path="mintRecipient" type="string" required>
+  The recipient in the destination's format, validated against it: - EVM: a
+  20-byte `0x` address. - Solana: the recipient's USDC associated token account,
+  base58. CCTP mints to a token account, not to a wallet, so derive the ATA from
+  the wallet and the destination's `usdc` mint. - Stellar: the `CctpForwarder`
+  contract as 32-byte hex. See [burns to Stellar](#burns-to-stellar). -
+  Starknet: the account felt, zero-padded to 32-byte hex with
+  `feltToBytes32Hex`.
+</ParamField>
+<ParamField path="fee" type="object" required>
+  <Expandable title="fee">
+    <ParamField path="tier" type="BurnFeeTier" required>
+      A row from `getBurnFees`, picked with `pickFeeTier`. A Fast tier on a
+      chain without `fastSource` throws `ProtocolError("no_route")`.
+    </ParamField>
+    <ParamField path="forwarderLevel" type='"low" | "med" | "high"'>
+      Which Iris forwarder fee to cover. Defaults to `"med"`.
+    </ParamField>
+    <ParamField path="forwarderBufferBps" type="number">
+      Whole basis points added to the forwarder fee. Defaults to `0`.
+    </ParamField>
+    <ParamField path="maxFee" type="bigint">
+      Burn with exactly this cap instead of the one computed from the tier. Pass
+      the `maxFee` the payer confirmed. Must be below `amount`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+<ParamField path="withForwarder" type="boolean">
+  Defaults to `true`: the burn carries `CCTP_FORWARD_HOOK_DATA` and Circle's
+  relayer submits the mint, paid out of the transfer. Set `false` when the
+  destination's `capabilities.forwardingDestination` is false; the builder does
+  not check this for you. With `false` the forwarder fee is left out of `maxFee`
+  and someone has to mint on the destination.
+</ParamField>
+<ParamField path="customHookData" type="`0x${string}`">
+  Hook data to send instead of the forwarder's. Setting it always selects
+  `depositForBurnWithHook`, even with `withForwarder: false`. Used for Stellar.
+</ParamField>
+<ParamField path="destinationCaller" type="`0x${string}`">
+  32 bytes. Who may call `receiveMessage` on the destination. Defaults to
+  `ANY_DESTINATION_CALLER` (all zeros).
+</ParamField>
+<ParamField path="approveAmount" type="bigint">
+  Allowance to approve. Defaults to `amount`; set it higher to skip the approve
+  on later burns. Lower than `amount` throws.
+</ParamField>
+<ParamField path="skipApprove" type="boolean">
+  Leave out the approve call when the wallet already has enough allowance on
+  `TokenMessengerV2`. Defaults to `false`.
+</ParamField>
+
+Returns a `BurnIntent`:
+
+<ResponseField name="calls" type="EvmCall[]">
+  Execute in order. Each is `{ to, data, value }` with `value` always `0n`.
+  Wallets that support EIP-5792 can batch them.
+</ResponseField>
+<ResponseField name="amount" type="bigint">
+  The burned amount, 6-decimal subunits.
+</ResponseField>
+<ResponseField name="maxFee" type="bigint">
+  The fee cap packed into the burn. Circle takes at most this much from
+  `amount`; the recipient gets at least `amount - maxFee`.
+</ResponseField>
+<ResponseField name="burnFee" type="bigint">
+  The computed protocol fee, for a fee breakdown.
+</ResponseField>
+<ResponseField name="forwarderFee" type="bigint">
+  The computed forwarder fee, `0n` with the forwarder off.
+</ResponseField>
+<ResponseField name="mintRecipientBytes32" type="`0x${string}`">
+  The recipient as it appears in the CCTP message.
+</ResponseField>
+<ResponseField name="withForwarder" type="boolean">
+  Whether the forwarder hook was set.
+</ResponseField>
+<ResponseField name="finalityThreshold" type="1000 | 2000">
+  `FINALITY_FAST` or `FINALITY_STANDARD`, from the tier.
+</ResponseField>
+<ResponseField name="source, destination" type="CctpChain">
+  The chains you passed.
+</ResponseField>
+
+If `maxFee` ends up negative or not below `amount`, the builder throws `InvalidInputError("invalid_amount")` because `TokenMessengerV2` would revert.
+
+### Burns to Stellar
+
+Stellar mints go through Circle's `CctpForwarder` contract, which mints to itself and passes the USDC to the recipient named in the hook data. Stellar is not on Circle's Forwarding Service, so there is no forwarder fee and the burn uses custom hook data instead:
+
+```ts
+import {
+  BaseSepolia,
+  StellarTestnet,
+  getBurnFees,
+  pickFeeTier,
+  buildBurnIntent,
+  buildStellarForwarderHookData,
+  contractStrkeyToBytes32Hex,
+} from "@usewhisk/cctp";
+
+const tiers = await getBurnFees(
+  "testnet",
+  BaseSepolia.cctpDomain,
+  StellarTestnet.cctpDomain,
+  { includeForwarderFee: false },
+);
+const forwarder = contractStrkeyToBytes32Hex(StellarTestnet.cctpForwarder);
+
+const intent = buildBurnIntent({
+  source: BaseSepolia,
+  destination: StellarTestnet,
+  amount: 5_000_000n,
+  mintRecipient: forwarder,
+  destinationCaller: forwarder,
+  withForwarder: false,
+  customHookData: buildStellarForwarderHookData(
+    "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+  ),
+  fee: { tier: pickFeeTier(tiers, "standard") },
+});
+```
+
+<Warning>
+  `mintRecipient` and `destinationCaller` must both be the forwarder. If
+  `mintRecipient` is the user's account, even decoded to 32 bytes, the USDC
+  never reaches the forwarder and is stuck for good.
+</Warning>
+
+`buildStellarForwarderHookData(recipient, integratorPayload?)` takes the final recipient as a G, M or C strkey and returns the hook data as hex: 24 zero bytes, a big-endian `u32` version (`0`), a big-endian `u32` length, the strkey as UTF-8, then the optional payload bytes. An invalid strkey throws `InvalidInputError("invalid_address")`.
+
+The recipient receives 7-decimal USDC on Stellar: the 6-decimal burn amount times 10.
+
+### `buildBurnWithFeesIntent`
+
+`buildBurnWithFeesIntent(input: BuildBurnWithFeesIntentInput): BurnWithFeesIntent`
+
+For chains with `capabilities.upfrontFeeSource`, Circle sells a signed quote for the Fast and forwarding fees, paid in USDC on top of the amount rather than out of it. The recipient then gets the full `amount`.
+
+```ts
+import {
+  Base,
+  Arbitrum,
+  getSignedBurnQuote,
+  buildBurnWithFeesIntent,
+} from "@usewhisk/cctp";
+
+const payer = "0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e";
+const amount = 100_000_000n;
+
+const quote = await getSignedBurnQuote(
+  "mainnet",
+  Base.cctpDomain,
+  Arbitrum.cctpDomain,
+  { amount, feeToken: Base.usdc, requests: ["PRE_FINALITY", "FORWARD"] },
+);
+
+const intent = buildBurnWithFeesIntent({
+  source: Base,
+  destination: Arbitrum,
+  amount,
+  fee: quote.feeTotalAmount,
+  mintRecipient: payer,
+  signedQuote: quote.signedQuote,
+  refundAddress: payer,
+});
+```
+
+<ParamField path="source" type="CctpChain" required>
+  An EVM chain with `tokenMessengerWithFees`. Others throw
+  `UnsupportedError("unsupported_chain")`.
+</ParamField>
+<ParamField path="destination" type="CctpChain" required>
+  Any other domain except Stellar, whose custom hook data Circle cannot bind to
+  an upfront fee.
+</ParamField>
+<ParamField path="amount" type="bigint" required>
+  Exactly the amount the quote was requested for, in 6-decimal subunits.
+</ParamField>
+<ParamField path="fee" type="bigint" required>
+  The quote's `feeTotalAmount`. The contract collects it on top of `amount`.
+</ParamField>
+<ParamField path="mintRecipient" type="string" required>
+  Same rules as `buildBurnIntent`.
+</ParamField>
+<ParamField path="signedQuote" type="`0x${string}`" required>
+  From `getSignedBurnQuote`, submitted as is.
+</ParamField>
+<ParamField path="refundAddress" type="string" required>
+  An EVM address. Circle reserves it for refunds it does not make today.
+</ParamField>
+<ParamField path="approveAmount" type="bigint">
+  Defaults to `amount + fee`. Lower throws.
+</ParamField>
+
+Returns `{ calls, amount, fee, mintRecipientBytes32 }`: an approve on USDC for `TokenMessengerWithFees`, then `depositForBurnWithFees`. The contract adds Circle's forwarding hook itself when the quote includes a `FORWARD` fee. The payer needs `amount + fee` USDC. Quotes expire; see [`getSignedBurnQuote`](/reference/cctp/iris#signed-upfront-fee-quotes).
+
+## EVM mints
+
+### `buildMintIntent`
+
+`buildMintIntent(input: BuildMintIntentInput): MintIntent`
+
+`receiveMessage(message, attestation)` on the destination's `MessageTransmitterV2`. Use it when the forwarder reports `FAILED`, or when you burned with `withForwarder: false`.
+
+```ts
+import {
+  ArbitrumSepolia,
+  buildMintIntent,
+  type IrisMessage,
+} from "@usewhisk/cctp";
+
+const { call } = buildMintIntent({
+  destination: ArbitrumSepolia,
+  message: msg.message,
+  attestation: msg.attestation,
+});
+console.log(call.to, call.data, call.value);
+```
+
+| Param         | Type                |                                                                                  |
+| ------------- | ------------------- | -------------------------------------------------------------------------------- |
+| `destination` | `CctpChain`         | Must be EVM. Other ecosystems throw `UnsupportedError` naming the right builder. |
+| `message`     | `` `0x${string}` `` | `IrisMessage.message`.                                                           |
+| `attestation` | `` `0x${string}` `` | `IrisMessage.attestation`.                                                       |
+
+Returns `{ destination, call }`, where `call` is an `EvmCall` with `value: 0n`. Anyone can submit it unless the burn set a `destinationCaller`; whoever submits it pays the destination gas. A message mints once: check [`isNonceUsed`](#reading-chain-state) before you ask someone to pay for a second try.
+
+## Solana
+
+### `buildSolanaBurnIntent`
+
+`buildSolanaBurnIntent(input: BuildSolanaBurnIntentInput): SolanaBurnIntent`
+
+Builds `deposit_for_burn`, or `deposit_for_burn_with_hook` when `hookData` is set, on the `TokenMessengerMinterV2` program, with all 18 accounts derived.
+
+```ts
+import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  SolanaDevnet,
+  BaseSepolia,
+  FINALITY_STANDARD,
+  buildSolanaBurnIntent,
+  burnIntentToTransactionInstruction,
+  toBytes32,
+  CCTP_FORWARD_HOOK_DATA,
+} from "@usewhisk/cctp";
+
+const eventData = Keypair.generate();
+const intent = buildSolanaBurnIntent({
+  source: SolanaDevnet,
+  destinationDomain: BaseSepolia.cctpDomain,
+  amount: 5_000_000n,
+  maxFee: 50_000n,
+  mintRecipientBytes32: Buffer.from(
+    toBytes32("0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e").slice(2),
+    "hex",
+  ),
+  owner,
+  ownerUsdcAta: getAssociatedTokenAddressSync(
+    new PublicKey(SolanaDevnet.usdc),
+    owner,
+  ),
+  messageSentEventDataKey: eventData.publicKey,
+  hookData: Buffer.from(CCTP_FORWARD_HOOK_DATA.slice(2), "hex"),
+  minFinalityThreshold: FINALITY_STANDARD,
+});
+
+const tx = new Transaction().add(burnIntentToTransactionInstruction(intent));
+tx.partialSign(eventData);
+```
+
+| Param                      | Type           |                                                                                                                                     |
+| -------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `source`                   | `SolanaChain`  | `Solana` or `SolanaDevnet`.                                                                                                         |
+| `destinationDomain`        | `number`       | The destination's `cctpDomain`.                                                                                                     |
+| `amount`                   | `bigint`       | 6-decimal subunits, above zero, at most 10M USDC, and above `maxFee`.                                                               |
+| `maxFee`                   | `bigint`       | Fee cap in 6-decimal subunits. Compute it with [`computeMaxFee`](/reference/cctp/fees#computemaxfee).                               |
+| `mintRecipientBytes32`     | `Uint8Array`   | 32 bytes. An EVM address left-padded (`toBytes32`), a Starknet felt zero-padded, the Stellar forwarder decoded (`strkeyTo32Bytes`). |
+| `owner`                    | `PublicKey`    | Signs, and pays the event account rent.                                                                                             |
+| `ownerUsdcAta`             | `PublicKey`    | The owner's USDC token account, which is debited.                                                                                   |
+| `messageSentEventDataKey`  | `PublicKey`    | A fresh keypair's public key. That keypair must also sign.                                                                          |
+| `minFinalityThreshold`     | `1000 \| 2000` | From the fee tier.                                                                                                                  |
+| `destinationCallerBytes32` | `Uint8Array`   | Optional, 32 bytes. Defaults to any caller.                                                                                         |
+| `hookData`                 | `Uint8Array`   | Optional, non-empty. The forwarder bytes, or the Stellar forwarder's hook data.                                                     |
+
+Returns `{ source, destinationDomain, amount, maxFee, instruction, messageSentEventDataKey, withHook }`. `instruction` is a `SolanaInstruction` (`{ programId, keys, data, ecosystem: "solana" }`), kept independent of `@solana/web3.js` minor versions; `burnIntentToTransactionInstruction(intent)` turns it into a `TransactionInstruction`.
+
+### `buildSolanaReceiveIntent`
+
+`buildSolanaReceiveIntent(input: BuildSolanaReceiveIntentInput): SolanaReceiveIntent`
+
+`receive_message` on `MessageTransmitterV2`, with the 20 accounts it and the `TokenMessengerMinterV2` CPI need. The fee recipient's token account is not derivable: read it from the TokenMessenger account on chain.
+
+```ts
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  SolanaDevnet,
+  BaseSepolia,
+  buildSolanaReceiveIntent,
+  receiveIntentToTransactionInstruction,
+  deriveTokenMessenger,
+  parseTokenMessengerFeeRecipient,
+  toBytes32,
+  type IrisMessage,
+} from "@usewhisk/cctp";
+
+const connection = new Connection(SolanaDevnet.defaultRpcUrls[0]);
+const usdcMint = new PublicKey(SolanaDevnet.usdc);
+
+const tokenMessenger = deriveTokenMessenger(
+  new PublicKey(SolanaDevnet.tokenMessengerMinter),
+);
+const account = await connection.getAccountInfo(tokenMessenger);
+if (!account) throw new Error("TokenMessenger account not found");
+const feeRecipient = parseTokenMessengerFeeRecipient(account.data);
+
+const hex = (h: string) => Buffer.from(h.slice(2), "hex");
+
+const intent = buildSolanaReceiveIntent({
+  destination: SolanaDevnet,
+  message: hex(msg.message),
+  attestation: hex(msg.attestation),
+  sourceDomain: BaseSepolia.cctpDomain,
+  sourceTokenBytes32: hex(toBytes32(BaseSepolia.usdc)),
+  feeRecipientUsdcAta: getAssociatedTokenAddressSync(usdcMint, feeRecipient),
+  recipientUsdcAta: getAssociatedTokenAddressSync(usdcMint, recipientWallet),
+  payer,
+});
+
+const tx = new Transaction().add(receiveIntentToTransactionInstruction(intent));
+```
+
+| Param                    | Type          |                                                                    |
+| ------------------------ | ------------- | ------------------------------------------------------------------ |
+| `destination`            | `SolanaChain` |                                                                    |
+| `message`, `attestation` | `Uint8Array`  | Raw bytes from Iris (decode the hex).                              |
+| `sourceDomain`           | `number`      | Domain of the burn's chain.                                        |
+| `sourceTokenBytes32`     | `Uint8Array`  | The source chain's USDC as 32 bytes.                               |
+| `feeRecipientUsdcAta`    | `PublicKey`   | USDC token account of the TokenMessenger's `fee_recipient`.        |
+| `recipientUsdcAta`       | `PublicKey`   | The recipient's USDC token account. It must exist before the mint. |
+| `payer`                  | `PublicKey`   | Pays and signs; also passed as `caller`.                           |
+
+Returns `{ destination, instruction }`. `receiveIntentToTransactionInstruction(intent)` converts it.
+
+### Solana helpers
+
+| Export                                                                                                        |                                                                                              |
+| ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `parseTokenMessengerFeeRecipient(data: Uint8Array): PublicKey`                                                | Reads `fee_recipient` from the TokenMessenger account data. Throws if the data is too short. |
+| `deriveTokenMessenger(tmm)`, `deriveTokenMinter(tmm)`, `deriveSenderAuthority(tmm)`                           | Config PDAs on `TokenMessengerMinterV2`.                                                     |
+| `deriveRemoteTokenMessenger(tmm, domain)`                                                                     | Seeded by the domain as a decimal string, not a `u32`.                                       |
+| `deriveLocalToken(tmm, mint)`, `deriveCustodyTokenAccount(tmm, mint)`                                         | Keyed by the local USDC mint.                                                                |
+| `deriveTokenPair(tmm, sourceDomain, sourceTokenBytes32)`                                                      | Maps a source token to the local mint.                                                       |
+| `deriveDenylistAccount(tmm, owner)`                                                                           | The burn fails if this PDA holds data.                                                       |
+| `deriveMessageTransmitter(mt)`, `deriveMessageTransmitterAuthority(mt, receiver)`                             | PDAs on `MessageTransmitterV2`.                                                              |
+| `deriveUsedNonce(mt, messageBytes)`                                                                           | The nonce PDA, from `message[12..44]`. Its existence means the message was received.         |
+| `deriveEventAuthority(programId)`                                                                             | Anchor's `__event_authority` PDA.                                                            |
+| `SOLANA_CCTP_PDA_SEEDS`                                                                                       | The seed prefixes as bytes.                                                                  |
+| `anchorDiscriminator(name)`                                                                                   | First 8 bytes of `sha256("global:" + name)`.                                                 |
+| `DISCRIMINATOR_DEPOSIT_FOR_BURN`, `DISCRIMINATOR_DEPOSIT_FOR_BURN_WITH_HOOK`, `DISCRIMINATOR_RECEIVE_MESSAGE` | Precomputed discriminators.                                                                  |
+| `SOLANA_ANY_DESTINATION_CALLER`                                                                               | The all-zero `PublicKey`.                                                                    |
+
+Every `derive*` function takes `PublicKey`s and returns the PDA `PublicKey`.
+
+## Stellar
+
+Stellar USDC has 7 decimals and CCTP messages carry 6. The Stellar builders take 7-decimal amounts; the contract drops the seventh decimal when it writes the message.
+
+### Stellar precision
+
+| Function                        |                                                                               |
+| ------------------------------- | ----------------------------------------------------------------------------- |
+| `canonicalToStellarSubunits(x)` | 6-decimal to 7-decimal: times 10. What a mint to Stellar delivers.            |
+| `stellarSubunitsToCanonical(x)` | 7-decimal to 6-decimal, rounding toward zero. What a burn from Stellar sends. |
+| `stellarBurnDust(x)`            | The seventh decimal a burn leaves in the sender's account.                    |
+
+So a burn of `12_345_678n` Stellar subunits (1.2345678 USDC) sends `1_234_567n` and leaves `8n` behind. Negative input throws `RangeError`.
+
+### `buildStellarBurnIntent`
+
+`buildStellarBurnIntent(input: BuildStellarBurnIntentInput): StellarBurnIntent`
+
+```ts
+import {
+  StellarTestnet,
+  BaseSepolia,
+  FINALITY_STANDARD,
+  buildStellarApproveInvocation,
+  buildStellarBurnIntent,
+  canonicalToStellarSubunits,
+  toBytes32,
+} from "@usewhisk/cctp";
+
+const amount = canonicalToStellarSubunits(5_000_000n);
+const maxFee = canonicalToStellarSubunits(5_000n);
+
+const approve = buildStellarApproveInvocation({
+  source: StellarTestnet,
+  owner: caller,
+  spender: StellarTestnet.tokenMessengerMinter,
+  amount,
+  expirationLedger: latestLedger + 100,
+});
+
+const burn = buildStellarBurnIntent({
+  source: StellarTestnet,
+  destinationDomain: BaseSepolia.cctpDomain,
+  mintRecipientBytes32: Buffer.from(
+    toBytes32("0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e").slice(2),
+    "hex",
+  ),
+  destinationCallerBytes32: new Uint8Array(32),
+  amount,
+  maxFee,
+  caller,
+  minFinalityThreshold: FINALITY_STANDARD,
+});
+```
+
+The token messenger pulls USDC with `transfer_from`, so the approve runs first. `buildStellarApproveInvocation` takes `source`, `owner` (strkey), `spender` (usually `tokenMessengerMinter`), `amount` in 7-decimal subunits and `expirationLedger`. The SAC rejects an allowance that expires before the current ledger, so pass the latest ledger plus a short window.
+
+`buildStellarBurnIntent` targets `deposit_for_burn`, or `deposit_for_burn_with_hook` when `hookData` is non-empty:
+
+| Param                      | Type           |                                                           |
+| -------------------------- | -------------- | --------------------------------------------------------- |
+| `source`                   | `StellarChain` |                                                           |
+| `destinationDomain`        | `number`       |                                                           |
+| `mintRecipientBytes32`     | `Uint8Array`   | 32 bytes. For Solana, the recipient's USDC token account. |
+| `destinationCallerBytes32` | `Uint8Array`   | 32 bytes. All zeros lets anyone mint. Required here.      |
+| `amount`, `maxFee`         | `bigint`       | 7-decimal Stellar subunits.                               |
+| `caller`                   | `string`       | G or C strkey that authorizes the burn.                   |
+| `minFinalityThreshold`     | `1000 \| 2000` | Always `FINALITY_STANDARD`: Stellar has no Fast Transfer. |
+| `hookData`                 | `Uint8Array`   | Optional.                                                 |
+
+Both return a `StellarInvocation`: `{ ecosystem: "stellar", contractId, functionName, args, operation }`, where `operation` is a ready `xdr.Operation` to wrap in a Soroban transaction. You assemble, simulate and sign the transaction. The burn intent is `{ source, destinationDomain, amount, maxFee, invocation, withHook }`.
+
+### `buildStellarMintIntent`
+
+`buildStellarMintIntent(input: BuildStellarMintIntentInput): StellarMintIntent`
+
+```ts
+import {
+  StellarTestnet,
+  buildStellarMintIntent,
+  type IrisMessage,
+} from "@usewhisk/cctp";
+
+const hex = (h: string) => Buffer.from(h.slice(2), "hex");
+
+const { invocation } = buildStellarMintIntent({
+  destination: StellarTestnet,
+  message: hex(msg.message),
+  attestation: hex(msg.attestation),
+});
+```
+
+Builds `mint_and_forward(message, attestation)` on the destination's `CctpForwarder`, which mints and passes the USDC to the recipient named in the hook data in one atomic call. Returns `{ destination, invocation }`.
+
+### Strkey helpers
+
+| Export                                           |                                                                                  |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `isValidStellarStrkey(s)`                        | `true` for a valid G, M or C strkey.                                             |
+| `strkeyType(s)`                                  | `"G" \| "M" \| "C"` (`StellarStrkeyType`). Throws on anything else.              |
+| `decodeStrkeyToBytes32(s)`, `strkeyTo32Bytes(s)` | The 32-byte payload CCTP carries. For an M address, the underlying account key.  |
+| `contractStrkeyToBytes32Hex(s)`                  | A C strkey as `0x` 32-byte hex, for EVM `mintRecipient` and `destinationCaller`. |
+| `encodeContractStrkey(bytes)`                    | 32 bytes back to a C strkey.                                                     |
+
+## Starknet
+
+### `buildStarknetBurnIntent`
+
+`buildStarknetBurnIntent(input: BuildStarknetBurnIntentInput): StarknetBurnIntent`
+
+```ts
+import {
+  StarknetSepolia,
+  BaseSepolia,
+  FINALITY_FAST,
+  buildStarknetApproveCall,
+  buildStarknetBurnIntent,
+  toBytes32,
+} from "@usewhisk/cctp";
+
+const amount = 5_000_000n;
+
+const approve = buildStarknetApproveCall({
+  source: StarknetSepolia,
+  spender: StarknetSepolia.tokenMessengerMinter,
+  amount,
+});
+
+const burn = buildStarknetBurnIntent({
+  source: StarknetSepolia,
+  destinationDomain: BaseSepolia.cctpDomain,
+  amount,
+  maxFee: 10_000n,
+  mintRecipient: BigInt(
+    toBytes32("0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e"),
+  ),
+  destinationCaller: 0n,
+  minFinalityThreshold: FINALITY_FAST,
+});
+
+const calls = [approve, burn.call];
+```
+
+Starknet USDC is ERC-20 style, so `buildStarknetApproveCall({ source, spender, amount })` comes first. Send both calls in one multicall.
+
+| Param                  | Type            |                                                                                 |
+| ---------------------- | --------------- | ------------------------------------------------------------------------------- |
+| `source`               | `StarknetChain` |                                                                                 |
+| `destinationDomain`    | `number`        |                                                                                 |
+| `amount`, `maxFee`     | `bigint`        | 6-decimal subunits.                                                             |
+| `mintRecipient`        | `bigint`        | The 32-byte recipient as a `u256`.                                              |
+| `destinationCaller`    | `bigint`        | `0n` lets anyone mint.                                                          |
+| `minFinalityThreshold` | `1000 \| 2000`  | From the fee tier.                                                              |
+| `hookData`             | `Uint8Array`    | Optional. Selects `deposit_for_burn_with_hook`, encoded as a Cairo `ByteArray`. |
+
+Returns `{ source, destinationDomain, amount, maxFee, call, withHook }`. A `StarknetCall` is `{ contractAddress, entrypoint, calldata }` with calldata as decimal felt strings, ready for `account.execute`.
+
+### `buildStarknetReceiveIntent`
+
+`buildStarknetReceiveIntent(input: BuildStarknetReceiveIntentInput): StarknetReceiveIntent`
+
+```ts
+import {
+  StarknetSepolia,
+  buildStarknetReceiveIntent,
+  type IrisMessage,
+} from "@usewhisk/cctp";
+
+const { call } = buildStarknetReceiveIntent({
+  destination: StarknetSepolia,
+  message: msg.message,
+  attestation: msg.attestation,
+});
+console.log(call.entrypoint, call.calldata.length);
+```
+
+`receive_message(message: ByteArray, attestation: ByteArray)` on the destination's `MessageTransmitter`. Takes the `0x` hex straight from Iris. Returns `{ destination, call }`. Starknet is not a Forwarding Service destination, so every transfer to Starknet ends with this call.
+
+### Felt and calldata helpers
+
+| Export                                                     |                                                                                   |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `isValidStarknetFelt(s)`, `assertStarknetFelt(s)`          | Check a `0x` felt of up to 64 hex digits; the second throws and returns it typed. |
+| `feltToBytes32Hex(felt)`                                   | Zero-pads to 32-byte hex, for `mintRecipient` from other chains.                  |
+| `bytes32HexToFelt(hex)`                                    | Back to a felt, leading zeros stripped.                                           |
+| `feltToBigInt(felt)`                                       | For `u256` arguments.                                                             |
+| `u256ToFelts(value)`                                       | `[low, high]` as decimal strings.                                                 |
+| `starknetFeltToString(value)`                              | A number, bigint or hex string as one decimal felt string.                        |
+| `bytesToByteArrayFelts(bytes)`, `hexToByteArrayFelts(hex)` | Raw bytes as Cairo `ByteArray` calldata.                                          |
+
+## Hook data and destination caller
+
+| Export                          |                                                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `CCTP_FORWARD_HOOK_DATA`        | The 32 bytes that ask Circle's relayer to mint: `"cctp-forward"`, zero padding, version `0`, payload length `0`. |
+| `CCTP_FORWARD_HOOK_DATA_LENGTH` | `32`.                                                                                                            |
+| `buildForwarderHookData()`      | Encodes the same bytes field by field.                                                                           |
+| `isForwarderHookData(hex)`      | `true` when `hex` starts with those 32 bytes.                                                                    |
+| `ANY_DESTINATION_CALLER`        | `bytes32(0)`: anyone may submit the mint.                                                                        |
+
+The forwarder fee is not in the hook data. Circle takes it, with the protocol fee, out of the burned amount, capped by `maxFee`. Size `maxFee` with [`computeMaxFee`](/reference/cctp/fees#computemaxfee) so it covers both: a cap one subunit short of the Fast fee turns a Fast transfer into a Standard one.
+
+## Address encoding
+
+```ts
+import {
+  toBytes32,
+  fromBytes32,
+  tryFromBytes32,
+  isAddress,
+  feltToBytes32Hex,
+  bytes32HexToFelt,
+  strkeyType,
+  strkeyTo32Bytes,
+  stellarSubunitsToCanonical,
+  stellarBurnDust,
+} from "@usewhisk/cctp";
+
+const evm = toBytes32("0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e");
+console.log(fromBytes32(evm), tryFromBytes32("0x01"), isAddress("0x12"));
+
+const starknet = feltToBytes32Hex(
+  "0x4bdde1e09a4b09a2f95d893d94a967b7717eb85a3f6deca8c080ee01fbc3370",
+);
+console.log(bytes32HexToFelt(starknet));
+
+const g = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H";
+console.log(strkeyType(g), strkeyTo32Bytes(g).length);
+
+console.log(
+  stellarSubunitsToCanonical(12_345_678n),
+  stellarBurnDust(12_345_678n),
+);
+```
+
+- `toBytes32(address)` left-pads a 20-byte EVM address to 32 bytes, lowercase. Throws `InvalidAddressError`.
+- `fromBytes32(value)` strips the padding and returns the lowercase address. Throws `InvalidBytes32Error` when the value is not 32 bytes or the top 12 bytes are not zero. `tryFromBytes32` returns `undefined` instead.
+- `isAddress(value)` checks for `0x` and 40 hex digits. It does not check the checksum.
+
+## Decoding a message
+
+`decodeBurnMessage(message)` splits the attested bytes into the header and burn body. Use it to check what a message will mint before you pay gas for it.
+
+```ts
+import {
+  ArbitrumSepolia,
+  decodeBurnMessage,
+  fromBytes32,
+  isNonceUsed,
+  getTransactionStatus,
+  type IrisMessage,
+} from "@usewhisk/cctp";
+
+const decoded = decodeBurnMessage(msg.message);
+console.log(
+  decoded.sourceDomain,
+  decoded.body.amount,
+  decoded.body.feeExecuted,
+  fromBytes32(decoded.body.mintRecipient),
+);
+
+const minted = await isNonceUsed(ArbitrumSepolia, decoded.nonce);
+if (!minted) {
+  console.log("Still needs a mint");
+}
+
+const status = await getTransactionStatus(ArbitrumSepolia, mintTxHash, {
+  rpcUrls: ["https://my-node.example/arbitrum-sepolia"],
+});
+```
+
+`DecodedBurnMessage` has `version`, `sourceDomain`, `destinationDomain`, `nonce`, `sender`, `recipient`, `destinationCaller`, `minFinalityThreshold`, `finalityThresholdExecuted` and a `body` with `version`, `burnToken`, `mintRecipient`, `amount`, `messageSender`, `maxFee`, `feeExecuted`, `expirationBlock` and `hookData`. Addresses are the 32-byte form; amounts are 6-decimal `bigint` subunits. The recipient gets `amount - feeExecuted`. `expirationBlock` is a destination block height, `0n` once the message is final; past it, ask Iris to [reattest](/reference/cctp/iris#reattest). Non-hex or short input throws `InvalidInputError`.
+
+## Reading chain state
+
+A few JSON-RPC reads cover what a recovery flow or a recipient check needs. Each tries `options.rpcUrls` first, then the chain's `defaultRpcUrls`, moving on after a failed or malformed answer, and throws `ProtocolError("rpc_unavailable")` when every URL fails. `RpcOptions` is `{ rpcUrls?: readonly string[]; fetch?: typeof fetch }`.
+
+```ts
+import {
+  StarknetSepolia,
+  StellarTestnet,
+  BaseSepolia,
+  getUsdcBalance,
+  getGasPrice,
+  getBlockNumber,
+  isStarknetNonceUsed,
+  isStellarNonceUsed,
+  getStarknetTransactionStatus,
+  getStarknetClassHashAt,
+} from "@usewhisk/cctp";
+
+const balance = await getUsdcBalance(
+  BaseSepolia,
+  "0x4f2a1c7e9b3d5a8f6e0c2b4d7a9f1e3c5b8d0a2e",
+);
+const gasPrice = await getGasPrice(BaseSepolia);
+const head = await getBlockNumber(BaseSepolia);
+const onStarknet = await isStarknetNonceUsed(StarknetSepolia, nonce);
+const onStellar = await isStellarNonceUsed(StellarTestnet, nonce);
+const tx = await getStarknetTransactionStatus(StarknetSepolia, "0x1234");
+if (tx.state !== "pending") console.log(tx.blockNumber);
+const classHash = await getStarknetClassHashAt(
+  StarknetSepolia,
+  "0x04a3f9c2b7d1e8a6c5f0b3d9e2a7c1f6b8d4e0a5c3f7b2d9e6a1c8f4b0d3e7a2",
+);
+if (classHash === null) console.log("no account deployed there");
+```
+
+| Function                                            | Returns                                                                                                                                                                                                          |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `getUsdcBalance(evmChain, owner)`                   | USDC balance in 6-decimal subunits.                                                                                                                                                                              |
+| `getGasPrice(evmChain)`                             | `eth_gasPrice` in wei (on Arc, 18-decimal USDC units).                                                                                                                                                           |
+| `getBlockNumber(evmChain)`                          | Latest block as `bigint`.                                                                                                                                                                                        |
+| `getTransactionStatus(evmChain, hash)`              | `TransactionStatus`: `"success"`, `"reverted"`, or `"unknown"` until mined.                                                                                                                                      |
+| `isNonceUsed(evmChain, nonce)`                      | `true` once the message was received on that chain. A second mint would revert.                                                                                                                                  |
+| `isStarknetNonceUsed(starknetChain, nonce)`         | The same on Starknet.                                                                                                                                                                                            |
+| `isStellarNonceUsed(stellarChain, nonce)`           | The same on Stellar, read by simulating the call.                                                                                                                                                                |
+| `getStarknetTransactionStatus(starknetChain, hash)` | `StarknetTransactionStatus`: `{ state: "pending" }` or `{ state: "success" \| "reverted", blockNumber }`.                                                                                                        |
+| `getStarknetClassHashAt(starknetChain, address)`    | The class hash of the contract at `address` (`starknet_getClassHashAt` at `latest`), or `null` when nothing is deployed there (RPC error 20). `@usewhisk/core` uses it to refuse undeployed Starknet recipients. |
+
+`nonce` is the 32-byte `0x` nonce from the message (`decodeBurnMessage(msg).nonce`). For Solana, check whether the `deriveUsedNonce` account exists.
+
+The public RPCs in the registry are rate-limited and sometimes wrong. Pass your own `rpcUrls` for anything that decides whether to move money.

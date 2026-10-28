@@ -1,0 +1,239 @@
+---
+title: Recipients
+description: How Whisk turns what the payer types into a destination address, and what each ecosystem needs from a recipient before USDC can land.
+---
+
+The engine resolves free-text recipient input (an address, an ENS name, or anything your own resolver understands) into a `ResolvedRecipient` for the destination chain. Resolvers run in order and the first match wins.
+
+```ts
+import {
+  addressResolver,
+  composeResolvers,
+  createWhisk,
+  type Resolver,
+} from "@usewhisk/core";
+
+declare function lookupHandle(handle: string): Promise<string | null>;
+
+const handles: Resolver = {
+  name: "handles",
+  matches: (input) => /^@[a-z0-9_]{2,32}$/i.test(input),
+  resolve: async (input, { chain }) => {
+    const address = await lookupHandle(input.slice(1));
+    return address ? { address, chain, displayName: input } : null;
+  },
+};
+
+const engine = createWhisk({
+  chains: ["Base", "Solana"],
+  resolver: composeResolvers([addressResolver, handles]),
+});
+
+const recipient = await engine.resolve("@alice", "Base");
+```
+
+## Resolvers
+
+A `Resolver` has a `name`, a synchronous `matches(input)` shape check, and an async `resolve(input, { chain })` that returns a `ResolvedRecipient` or `null`. `chain` is the destination chain.
+
+- `engine.resolve(input, chain)` trims the input, then throws `ConfigError` if no resolver matches it or the resolver returns `null`.
+- `composeResolvers(resolvers, { name? })` asks each resolver whose `matches` is true, in order, and returns the first non-null result. A resolver that throws anything other than a `ResolverError` is wrapped in one, tagged with its name.
+- Return `null` to let the next resolver try. Throw `ResolverError` for a real failure, such as a lookup service being down.
+
+Whisk ships these:
+
+| Resolver                         | Package           | What it does                                                                            |
+| -------------------------------- | ----------------- | --------------------------------------------------------------------------------------- |
+| `addressResolver`                | `@usewhisk/core`  | Accepts a raw address in the destination ecosystem's format. The `createWhisk` default. |
+| `ensResolver`                    | `@usewhisk/react` | ENS on Ethereum mainnet.                                                                |
+| `sepoliaEnsResolver`             | `@usewhisk/react` | ENS on Sepolia.                                                                         |
+| `createEnsResolver(options)`     | `@usewhisk/react` | ENS with your own RPC URLs, viem client, or fallback setting.                           |
+| `createDefaultResolver(options)` | `@usewhisk/react` | Addresses, then ENS. The `<WhiskProvider>` default.                                     |
+
+`createDefaultResolver` looks up ENS on mainnet for a mainnet destination. For a testnet destination it tries Sepolia ENS first, then mainnet ENS. Its options are those of `createEnsResolver` without `chain`:
+
+```ts
+import { createDefaultResolver, createWhiskConfig, evm } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base", "Arc"],
+  resolver: createDefaultResolver({
+    rpcUrl: "https://ethereum-rpc.publicnode.com",
+  }),
+});
+```
+
+### ENS lookups
+
+The ENS resolvers match any `label.tld` input and always query Ethereum L1 (mainnet or Sepolia). They follow ENSIP-11:
+
+- an EVM destination asks for the address under that chain's coin type (`60` on Ethereum mainnet, `0x80000000 | chainId` elsewhere);
+- when the name has no address for that coin type, an EVM destination falls back to the name's Ethereum address, as MetaMask and Rainbow do. Turn this off with `fallbackToEthAddress: false`;
+- a Solana destination asks for coin type `501`.
+
+The result must still match the destination's address format, or the resolver returns `null`.
+
+<Warning>
+  Use `@usewhisk/react` 0.3.0 or later. Before 0.3.1 an ENS name resolved to its
+  Ethereum address for a Starknet destination. Up to 0.2.1 that 20-byte `0x`
+  address passed Starknet's address check, so USDC would have been minted to an
+  account nobody controls. From 0.2.2 the quote refuses it before the burn, and
+  from 0.3.1 ENS names do not resolve for Starknet or Stellar destinations at
+  all, so the payer enters a native address.
+</Warning>
+
+The default RPC lists (`DEFAULT_ENS_RPC_URLS`, `DEFAULT_ENS_SEPOLIA_RPC_URLS`) are public endpoints that allow browser requests. Pass your own `rpcUrl` (one URL, or several tried by latency) for production traffic.
+
+## Address formats
+
+`addressFormat(chain)` returns the pattern and a hint for the destination's ecosystem, for form validation:
+
+```ts
+import { addressFormat } from "@usewhisk/core";
+
+const { pattern, hint } = addressFormat("Starknet");
+
+function checkInput(input: string): string | null {
+  return pattern.test(input.trim()) ? null : `Expected ${hint}`;
+}
+```
+
+| Ecosystem | Format                                                                   | Checked at quote time                                        |
+| --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| EVM       | `0x` and 40 hex characters                                               | viem `isAddress`, including the checksum on mixed-case input |
+| Solana    | Base58, 32 to 44 characters: the recipient's wallet, not a token account | A valid public key                                           |
+| Stellar   | Strkey: `G...` account, `M...` muxed account, or `C...` contract         | A valid strkey of one of those three types                   |
+| Starknet  | `0x` and 1 to 64 hex characters (a felt252)                              | The shape, the address range, and a deployed account         |
+
+The pattern is a shape check. `engine.quote` validates the recipient fully for the destination ecosystem and throws `InvalidAddressError` before anything is signed. For Starknet it also reads the chain; see [Starknet](#starknet-felt-addresses).
+
+## Solana: the recipient's USDC account
+
+On Solana, USDC sits in an associated token account derived from the wallet. A CCTP mint cannot create that account, so a bridge into Solana burns to the recipient's existing USDC account.
+
+Before the burn, Whisk uses the destination Solana wallet to check that:
+
+- the wallet is on the destination's cluster (mainnet-beta or devnet), else the failure is a `WrongChainError`;
+- the recipient's USDC account exists.
+
+If the account is missing, `send` returns a failure with `RouteUnavailableError`, `reason: "recipient_account_missing"`, and nothing is signed or burned. The recipient (or anyone) has to create the account first, for example by receiving any amount of USDC on Solana.
+
+```ts
+import { RouteUnavailableError, type SendResult } from "@usewhisk/core";
+
+declare const result: SendResult;
+
+if (
+  result.kind === "failure" &&
+  result.error instanceof RouteUnavailableError &&
+  result.error.reason === "recipient_account_missing"
+) {
+  console.log("Ask the recipient to open a USDC account on Solana first.");
+}
+```
+
+A same-chain send on Solana is different: it creates the recipient's USDC account in the same transaction if needed, and the payer pays the account rent.
+
+## Stellar: trustlines and the forwarder
+
+A Stellar `G...` or `M...` account can only hold USDC once it has a USDC trustline. A `C...` contract needs none.
+
+- **Same-chain sends** to an account without a trustline fail on chain with `TrustlineMissing`. No USDC moves.
+- **Bridges into Stellar** burn to Circle's `CctpForwarder` contract, with the real recipient in the burn's hook data. The destination Stellar wallet then signs `mint_and_forward`, which mints to the forwarder and passes the USDC on to the recipient in one transaction. Whisk sets both `mintRecipient` and `destinationCaller` to the forwarder, as Circle requires; a burn to a Stellar wallet directly could never be minted.
+
+Before a bridge into Stellar burns anything, Whisk uses the destination Stellar wallet to check that:
+
+- the wallet is on the destination's network (`public` or `testnet`), else the failure is a `WrongChainError`;
+- a `G...` recipient, or the `G...` account behind an `M...` address, holds a USDC trustline that the issuer has authorized, with room under its limit for the amount. A `C...` recipient is not checked, since a contract holds USDC without a trustline.
+
+If the trustline is missing, not authorized or full, `send` returns a failure with `RouteUnavailableError`, `reason: "recipient_account_missing"`, and nothing is signed or burned. The recipient has to add or raise the USDC trustline first. A trustline that cannot be read, such as on an RPC error, also stops the send before the burn; it is never taken as either answer.
+
+```ts
+import { RouteUnavailableError, type SendResult } from "@usewhisk/core";
+
+declare const result: SendResult;
+
+if (
+  result.kind === "failure" &&
+  result.error instanceof RouteUnavailableError &&
+  result.error.reason === "recipient_account_missing" &&
+  result.error.ecosystem === "stellar"
+) {
+  console.log("Ask the recipient to add a USDC trustline on Stellar first.");
+}
+```
+
+Whisk reads the trustline through the destination adapter's `getTrustline`. The adapter from `useStellarAdapter` has it. A custom `StellarAdapter` without it can still bridge into `C...` addresses, but a bridge into a `G...` or `M...` address is refused before the burn with a `ConfigError`. See [StellarAdapter](/reference/core/engine#stellaradapter).
+
+## Starknet: felt addresses
+
+A Starknet address is a felt252, written as `0x` and up to 64 hex characters. Whisk zero-pads it to 32 bytes for the CCTP message. Bridges into Starknet need a Starknet wallet to sign `receive_message`, since Circle does not forward to Starknet.
+
+A quote into Starknet, for a bridge or a same-chain send, checks the recipient in two steps before anything is signed:
+
+- **Shape.** An address below `2**160`, one that fits in 20 bytes, is refused with `InvalidAddressError`. Starknet account addresses are hashes, so an address that small is almost always an Ethereum address pasted by mistake, even when it is zero-padded to 64 hex characters. An address at or past `2**251 - 256`, outside Starknet's address range, is refused too.
+- **Deployed account.** The engine reads the class hash at the address with `starknet_getClassHashAt`, over the configured `rpcUrls` for the destination chain and then the registry's defaults. With no contract there, `quote` throws `RouteUnavailableError` with `reason: "recipient_not_deployed"`. An RPC failure fails the quote; it is never read as either answer.
+
+An undeployed account can still be real. USDC sent to it is held at the address, and its owner can spend it once their wallet deploys the account, which the wallet does with its first transaction. So when the payer confirms the address is their own new wallet, quote again with `allowUndeployedRecipient: true`. The address of a connected Starknet wallet, passed as `adapter` or `destinationAdapter`, skips the deployed check, since that wallet controls it.
+
+```ts
+import {
+  RouteUnavailableError,
+  type Quote,
+  type QuoteParams,
+  type WhiskEngine,
+} from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare function payerConfirms(address: string): Promise<boolean>;
+
+export async function quoteIntoStarknet(
+  params: QuoteParams,
+): Promise<Quote | null> {
+  try {
+    return await engine.quote(params);
+  } catch (err) {
+    if (
+      err instanceof RouteUnavailableError &&
+      err.reason === "recipient_not_deployed"
+    ) {
+      if (!(await payerConfirms(params.recipient.address))) return null;
+      return engine.quote({ ...params, allowUndeployedRecipient: true });
+    }
+    throw err;
+  }
+}
+```
+
+`<WhiskSend>` does this itself: it shows a warning with an "It's my wallet, continue" button, then quotes again with the flag for that address only.
+
+`engine.maxSendable` skips these checks, since it only works out fees, and so does the fresh quote `send` builds when fees rise, since the payer already confirmed that recipient.
+
+Before the burn on a bridge into Starknet, Whisk also checks that the destination Starknet wallet is on the destination's chain id, else the failure is a `WrongChainError`.
+
+## The resolved recipient
+
+<ResponseField name="address" type="string">
+  The destination address. For Solana it is the wallet; Whisk derives the USDC
+  account.
+</ResponseField>
+<ResponseField name="chain" type="Chain">
+  The destination chain the address was resolved for.
+</ResponseField>
+<ResponseField name="displayName" type="string">
+  Optional label, such as the ENS name or handle the payer typed.
+</ResponseField>
+
+`ResolvedRecipient` also has `needsClaimLink` and `claimToken`, reserved for resolvers that create a wallet for an off-platform recipient. Nothing in 0.3 sets or reads them.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Fund safety" href="/concepts/fund-safety">
+    Every check that runs before the burn.
+  </Card>
+  <Card title="Chains" href="/chains">
+    Supported chains per ecosystem.
+  </Card>
+</CardGroup>

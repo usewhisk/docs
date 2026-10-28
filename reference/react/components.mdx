@@ -1,0 +1,429 @@
+---
+title: "Components"
+description: "Every component @usewhisk/react exports, with its full props."
+---
+
+All components render inside `<WhiskProvider>` and read their engine, config and wallets from it. Import `@usewhisk/react/styles.css` once for their styles.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config} theme="auto">
+      <WhiskSend
+        tabs={["bridge"]}
+        amount="25"
+        recipient="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+        destinationChain="Arc_Testnet"
+        onSuccess={(result) => console.log(result.finalTxHash)}
+        onFailure={(result) => console.error(result.error.code)}
+      />
+    </WhiskProvider>
+  );
+}
+```
+
+## WhiskProvider
+
+Root provider for every Whisk component and hook. It creates the engine once on mount, mounts the wallet contexts for the factories in `config.wallets`, and wraps its children in a `<div data-whisk>` that carries the theme. Guide: [WhiskProvider](/widget/whisk-provider).
+
+```tsx Providers.tsx
+import { QueryClient } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+import { WhiskProvider, type WhiskClientConfig } from "@usewhisk/react";
+
+declare const config: WhiskClientConfig;
+const queryClient = new QueryClient();
+
+export function Providers({ children }: { children: ReactNode }) {
+  return (
+    <WhiskProvider
+      config={config}
+      queryClient={queryClient}
+      theme={{ preset: "dark", tokens: { primary: "#2b3cff", radius: "6px" } }}
+    >
+      {children}
+    </WhiskProvider>
+  );
+}
+```
+
+<ParamField path="config" type="WhiskClientConfig" required>
+  From [createWhiskConfig](/reference/react/config). Read once: the engine is
+  built on the first render and later changes to `config` do not reach it.
+  Wallet contexts and `useWhiskContext().config` do follow the new object.
+</ParamField>
+
+<ParamField path="theme" type="WhiskThemeInput">
+  Defaults to `"light"`. A preset name (`"light"`, `"dark"`, `"wine"`, `"indigo"`, `"emerald"`, `"monochrome"`), `"auto"` to follow `prefers-color-scheme` in CSS, `{ preset, tokens }` to replace some tokens, or a full `WhiskTheme`. See [Theme](/reference/react/config#theme).
+</ParamField>
+
+<ParamField path="queryClient" type="QueryClient">
+  A TanStack Query client to use when none is mounted above. An outer `<QueryClientProvider>` is detected and reused, and then this prop is ignored. Without either, the provider creates its own client.
+</ParamField>
+
+<ParamField path="children" type="ReactNode" required>
+  Your app, or just the part that uses Whisk.
+</ParamField>
+
+Behaviour worth knowing:
+
+- An outer `<WagmiProvider>` is reused; `evm()`'s wagmi config is then ignored.
+- It throws `ConfigError` when `config.wallets` has no factory and no outer `<WagmiProvider>` exists.
+- The engine gets `config.resolver ?? createDefaultResolver()` and `config.inflightStore ?? createBrowserInflightStore()`.
+- Dropdowns and dialogs render into a `<div data-whisk-portal>` inside the themed root, so they keep the theme.
+
+`WhiskProviderProps` is the type of these props.
+
+## WhiskSend
+
+The drop-in widget. The Send tab moves USDC on one chain; the Bridge tab moves it across chains with CCTP. The source chain's ecosystem decides which connected wallet pays, and a bridge into another ecosystem uses the destination ecosystem's wallet for the mint when Circle does not forward it. Guide: [WhiskSend](/widget/whisk-send).
+
+<ParamField path="tabs" type={'ReadonlyArray<"send" | "bridge">'}>
+  Which tabs to show, in order. Defaults to `["send", "bridge"]`. With one entry
+  the tab bar is hidden. An empty array falls back to both.
+</ParamField>
+
+<ParamField path="title" type="string">
+  Heading. Defaults to `"Send USDC"`.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the title.
+</ParamField>
+
+<ParamField path="defaultAmount" type="string">
+  Initial amount, as a decimal USDC string. The payer can edit it.
+</ParamField>
+
+<ParamField path="amount" type="string">
+  Locks the amount to this decimal USDC string. Edits are ignored.
+</ParamField>
+
+<ParamField path="defaultRecipient" type="string">
+  Initial recipient input: an address, or anything the configured resolver
+  accepts.
+</ParamField>
+
+<ParamField path="recipient" type="string">
+  Locks the recipient input.
+</ParamField>
+
+<ParamField path="defaultSourceChain" type="Chain">
+  Initial source chain. Wins over `config.defaultSourceChain`.
+</ParamField>
+
+<ParamField path="sourceChain" type="Chain">
+  Locks the source chain.
+</ParamField>
+
+<ParamField path="defaultDestinationChain" type="Chain">
+  Initial destination for the Bridge tab. Wins over
+  `config.defaultDestinationChain`. If it is not on the source chain's network,
+  the widget switches to the first chain in `config.chains` that is.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain">
+  Locks the Bridge tab's destination.
+</ParamField>
+
+<ParamField path="onSuccess" type="(result: SendSuccess) => void">
+  Called once when `engine.send` resolves with `kind: "success"`. For a bridge,
+  `result.finalTxHash` is the mint transaction when known. With a `feePolicy`,
+  check `result.customFee.status`: the transfer can succeed with the fee unpaid.
+</ParamField>
+
+<ParamField path="onFailure" type="(result: SendFailure) => void">
+  Called when `engine.send` resolves with `kind: "failure"`. `result.steps`
+  shows how far it got: if the burn succeeded, the funds are in flight and the
+  widget's resume list can finish the transfer. Errors that `send` throws before
+  signing (expired quote, raised fees, low balance) are handled inside the
+  widget and do not call this.
+</ParamField>
+
+What it does on its own:
+
+- Resolves the recipient 320 ms after the last keystroke.
+- Quotes as soon as it has a recipient, an amount and a connected source wallet, and fetches a new quote 5 seconds before the current one expires.
+- On a `QuoteChangedError` it shows the old and new totals and asks the payer to press the button again. On a `QuoteExpiredError` it quotes again.
+- Shows the payer's USDC balance and a Max button on EVM sources (`engine.balance` and `engine.maxSendable`).
+- On a `RouteUnavailableError` with `reason: "recipient_not_deployed"`, shows a warning that no Starknet account is deployed at the address, with an "It's my wallet, continue" button. Pressing it quotes again with `allowUndeployedRecipient: true` for that address only.
+- After a successful transfer whose `customFee` is `unpaid`, the result banner says the fee was not paid, with the reason when there is one.
+- Renders `<ResumeList>`, `<ConnectModal>` and `<PoweredByWhisk>`.
+
+`WhiskSendProps` is the type of these props.
+
+## WhiskReceipt
+
+The status of one transfer, polled from Circle's Iris API with [useReceipt](/reference/react/hooks#usereceipt). A same-chain transfer shows as settled as soon as it has a source hash. A cross-chain transfer that has not settled gets a Finish transfer button, which calls `engine.resumeFromTx` with the connected wallet for the destination chain. Render it inside `<WhiskProvider>`: in 0.3 it reads the wallet adapters, which need the provider. Guide: [WhiskReceipt](/widget/whisk-receipt).
+
+```tsx Status.tsx
+import { WhiskReceipt } from "@usewhisk/react";
+
+export function Status({ txHash }: { txHash: string }) {
+  return (
+    <WhiskReceipt
+      sourceChain="Base_Sepolia"
+      sourceTxHash={txHash}
+      destinationChain="Arc_Testnet"
+      pollIntervalMs={5000}
+    />
+  );
+}
+```
+
+<ParamField path="sourceChain" type="Chain" required>
+  Chain the transfer was sent from.
+</ParamField>
+
+<ParamField path="sourceTxHash" type="string | undefined" required>
+  The burn (or same-chain transfer) hash. While `undefined`, the card asks for
+  one and does not poll.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain" required>
+  Equal to `sourceChain` for a same-chain send.
+</ParamField>
+
+<ParamField path="destinationTxHash" type="string">
+  The mint hash, when known. Marks the transfer settled and stops polling.
+</ParamField>
+
+<ParamField path="hasError" type="boolean">
+  Forces the failed stage, for example after a `SendFailure`. Stops polling.
+</ParamField>
+
+<ParamField path="title" type="string">
+  Defaults to `"Transfer status"`.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the chain labels.
+</ParamField>
+
+<ParamField path="pollIntervalMs" type="number">
+  Iris poll interval. Defaults to 3000.
+</ParamField>
+
+<ParamField path="pollTimeoutMs" type="number">
+  Stops polling after this long. Defaults to 600000 (10 minutes).
+</ParamField>
+
+`WhiskReceiptProps` is the type of these props.
+
+## ResumeList
+
+```tsx
+<ResumeList />
+```
+
+No props. Lists the transfers in the engine's `inflightStore` (`engine.inflight()`), each with a Resume button (`engine.resume` with the connected wallet for the destination chain) and a Dismiss button (`engine.dismiss`). Renders nothing when the store is empty. `<WhiskSend>` already includes it. Guide: [ResumeList](/widget/resume-list).
+
+## ConnectModal
+
+A dialog to pick an ecosystem, then a wallet in it. Ecosystems without a factory in `config.wallets` are shown disabled. While a wallet is connected it shows the account and a disconnect button. Guide: [ConnectModal](/widget/connect-modal).
+
+<ParamField path="open" type="boolean" required>
+  Controlled open state.
+</ParamField>
+
+<ParamField path="onOpenChange" type="(open: boolean) => void" required>
+  Called to open or close. The modal closes itself after a successful connect.
+</ParamField>
+
+<ParamField path="title" type="string">
+  Defaults to a title for the current step.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the title.
+</ParamField>
+
+`ConnectModalProps` is the type of these props.
+
+## Primitives
+
+The building blocks of the widgets, for custom UIs that keep the Whisk look. Guide: [Primitives](/widget/primitives).
+
+```tsx CustomWidget.tsx
+import { useState } from "react";
+import {
+  Banner,
+  Button,
+  Card,
+  ChainPicker,
+  ConnectModal,
+  FieldBox,
+  PoweredByWhisk,
+  ResumeList,
+  StepRail,
+  type Chain,
+  type Step,
+} from "@usewhisk/react";
+
+const steps: Step[] = [
+  { name: "approve", state: "success" },
+  { name: "burn", state: "pending" },
+];
+
+export function CustomWidget() {
+  const [open, setOpen] = useState(false);
+  const [chain, setChain] = useState<Chain>("Base_Sepolia");
+  const [amount, setAmount] = useState("");
+  return (
+    <Card>
+      <ResumeList />
+      <ChainPicker
+        value={chain}
+        onChange={setChain}
+        chains={["Base_Sepolia", "Arc_Testnet"]}
+        ariaLabel="From"
+      />
+      <FieldBox
+        label="Amount"
+        variant="amount"
+        inputMode="decimal"
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+        suffix="USDC"
+        help="Up to 6 decimals"
+      />
+      <StepRail steps={steps} labels={{ burn: "Burning USDC" }} />
+      <Banner variant="warning" action={<Button size="sm">Retry</Button>}>
+        Waiting for Circle.
+      </Banner>
+      <Button variant="primary" onClick={() => setOpen(true)}>
+        Connect wallet
+      </Button>
+      <ConnectModal open={open} onOpenChange={setOpen} title="Pick a wallet" />
+      <PoweredByWhisk />
+    </Card>
+  );
+}
+```
+
+### Card
+
+Takes every `HTMLAttributes<HTMLDivElement>` prop and forwards its ref. Adds the `whisk-card` class.
+
+### Button
+
+`ButtonProps` is `ButtonHTMLAttributes<HTMLButtonElement>` plus the props below. Forwards its ref, and defaults `type` to `"button"` so it never submits a surrounding form.
+
+<ParamField
+  path="variant"
+  type={'"primary" | "secondary" | "ghost" | "outline"'}
+>
+  `ButtonVariant`. Defaults to `"primary"`.
+</ParamField>
+
+<ParamField path="size" type={'"sm" | "md"'}>
+  `ButtonSize`. Defaults to `"md"`.
+</ParamField>
+
+<ParamField path="iconStart" type="ReactNode">
+  Rendered before `children`.
+</ParamField>
+
+<ParamField path="iconEnd" type="ReactNode">
+  Rendered after `children`.
+</ParamField>
+
+### Banner
+
+`BannerProps` is `HTMLAttributes<HTMLDivElement>` plus the props below. The `role` defaults to `"alert"` for errors and `"status"` otherwise.
+
+<ParamField path="variant" type={'"info" | "warning" | "error"'}>
+  `BannerVariant`. Defaults to `"info"`.
+</ParamField>
+
+<ParamField path="icon" type="ReactNode">
+  Rendered before the text.
+</ParamField>
+
+<ParamField path="action" type="ReactNode">
+  Rendered after the text, such as a retry button.
+</ParamField>
+
+### ChainPicker
+
+A select of chain labels. `ChainPickerProps` is the type of its props. The list renders into the widget's portal, so it must be inside `<WhiskProvider>` to keep the theme.
+
+<ParamField path="value" type="Chain" required>
+  The selected chain.
+</ParamField>
+
+<ParamField path="onChange" type="(chain: Chain) => void" required>
+  Called with the picked chain.
+</ParamField>
+
+<ParamField path="chains" type="ReadonlyArray<Chain>" required>
+  The options, shown by their labels.
+</ParamField>
+
+<ParamField path="ariaLabel" type="string">
+  Defaults to `"Chain"`.
+</ParamField>
+
+<ParamField path="disabled" type="boolean">
+  Disables the picker.
+</ParamField>
+
+<ParamField path="className" type="string">
+  Added to the trigger.
+</ParamField>
+
+### FieldBox
+
+A labelled input. `FieldBoxProps` is every `InputHTMLAttributes<HTMLInputElement>` prop except `size`, plus the props below. Forwards its ref to the `<input>`.
+
+<ParamField path="label" type="ReactNode" required>
+  The label, tied to the input.
+</ParamField>
+
+<ParamField path="suffix" type="ReactNode">
+  Rendered after the input, such as a token tag or paste button.
+</ParamField>
+
+<ParamField path="help" type="ReactNode">
+  Help text under the field.
+</ParamField>
+
+<ParamField path="error" type="ReactNode">
+  Marks the field invalid (`aria-invalid`) and replaces `help`, announced with
+  `role="alert"`.
+</ParamField>
+
+<ParamField path="variant" type={'"default" | "amount" | "mono"'}>
+  `"amount"` enlarges the input; `"mono"` uses the monospace font. Defaults to
+  `"default"`.
+</ParamField>
+
+### StepRail
+
+Renders a `Step[]` from the engine or from `deriveReceiptView`. `StepRailProps` is the type of its props. The first `pending` step is shown as active, and a forwarded mint is labelled "(forwarder)".
+
+<ParamField path="steps" type="ReadonlyArray<Step>" required>
+  The steps to show, in order.
+</ParamField>
+
+<ParamField path="labels" type="Partial<Record<StepName, string>>">
+  Replaces the default labels: "Approve USDC", "Transfer", "Burn on source
+  chain", "Confirm attestation", "Mint on destination".
+</ParamField>
+
+### PoweredByWhisk
+
+No props. The attribution badge, styled with inline `!important` declarations so host CSS cannot hide it. `<WhiskSend>` and `<WhiskReceipt>` already render it.

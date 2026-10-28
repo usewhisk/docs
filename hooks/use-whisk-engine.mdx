@@ -1,0 +1,157 @@
+---
+title: useWhiskEngine and useWhiskContext
+sidebarTitle: useWhiskEngine
+description: Reach the engine and config that WhiskProvider built, for direct engine calls inside React.
+---
+
+`useWhiskEngine` returns the `WhiskEngine` that `<WhiskProvider>` created. Use it
+for anything the other hooks do not wrap: balances, in-flight transfers,
+resuming, or quoting with a non-EVM wallet.
+
+```tsx PendingTransfers.tsx
+import { useEffect, useState } from "react";
+import { useWhiskEngine } from "@usewhisk/react";
+import type { InflightRecord } from "@usewhisk/core";
+
+export function PendingTransfers() {
+  const engine = useWhiskEngine();
+  const [records, setRecords] = useState<readonly InflightRecord[]>([]);
+
+  useEffect(() => {
+    engine.inflight().then(setRecords, console.error);
+  }, [engine]);
+
+  return (
+    <ul>
+      {records.map((r) => (
+        <li key={r.id}>
+          {r.sourceChain} to {r.destinationChain}: {r.step}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+It is the same engine you would get from `createWhisk` in
+[`@usewhisk/core`](/headless/core-engine), so every method on
+[the engine reference](/reference/core/engine) is available. The difference is
+what the provider set up for it:
+
+- It is built once, on the provider's first mount, from the provider's
+  `config`. Later changes to `config` do not reach it.
+- Its resolver is `config.resolver`, or addresses plus ENS when you set none.
+- Its in-flight store is `config.inflightStore`, or `localStorage` when the
+  page can write to it (memory otherwise, as in Safari private mode or during
+  server rendering).
+
+Methods that sign take an adapter. Get one from the
+[wallet adapter hooks](/hooks/wallet-adapters).
+
+## Balances
+
+`engine.balance` returns USDC subunits as a `bigint` (6 decimals). Format it
+only for display.
+
+```tsx UsdcBalance.tsx
+import { useEffect, useState } from "react";
+import { formatUsdcAmount, useWhisk } from "@usewhisk/react";
+
+export function UsdcBalance() {
+  const { engine, address } = useWhisk();
+  const [balance, setBalance] = useState<bigint | null>(null);
+
+  useEffect(() => {
+    if (!address) return;
+    engine
+      .balance({ chain: "Base_Sepolia", address })
+      .then(setBalance, console.error);
+  }, [engine, address]);
+
+  if (balance === null) return null;
+  return <p>{formatUsdcAmount(balance)} USDC on Base Sepolia</p>;
+}
+```
+
+`balance` and `maxSendable` read EVM chains only today. They return `null` for
+a Solana, Stellar or Starknet source
+([usewhisk/whisk#157](https://github.com/usewhisk/whisk/issues/157)).
+
+## Finishing a transfer
+
+A bridge is written to the in-flight store from the moment the payer is asked
+to sign. If the page closes between the burn and the mint, the record is still
+there on the next load. `engine.resume` finishes it without signing the burn
+again.
+
+```ts useFinishTransfer.ts
+import { useAdapterFor, useWhiskEngine } from "@usewhisk/react";
+import type { InflightRecord } from "@usewhisk/core";
+
+export function useFinishTransfer() {
+  const engine = useWhiskEngine();
+  const adapterFor = useAdapterFor();
+
+  return async function finish(record: InflightRecord) {
+    const destinationAdapter = adapterFor(record.destinationChain);
+    const result = await engine.resume(record, {
+      ...(destinationAdapter && { destinationAdapter }),
+    });
+    if (result.kind === "success") await engine.dismiss(record.id);
+    return result;
+  };
+}
+```
+
+Records stay in the store until you call `dismiss`, even after a successful
+mint. [`<ResumeList>`](/widget/resume-list) does this with its own UI; see
+[recovery](/concepts/recovery) for the full flow.
+
+`InflightRecord` is exported from `@usewhisk/core`, not from
+`@usewhisk/react`. Add `@usewhisk/core` to your dependencies to import its
+type.
+
+## useWhiskContext
+
+`useWhiskContext` returns everything the provider holds:
+
+<ResponseField name="engine" type="WhiskEngine">
+  The engine, as returned by `useWhiskEngine`.
+</ResponseField>
+
+<ResponseField name="config" type="WhiskClientConfig">
+  The `config` prop passed to `<WhiskProvider>`, including `wallets` and
+  `chains`.
+</ResponseField>
+
+<ResponseField name="theme" type="WhiskThemeInput | undefined">
+  The `theme` prop passed to `<WhiskProvider>`.
+</ResponseField>
+
+```tsx ChainList.tsx
+import { useWhiskContext } from "@usewhisk/react";
+
+export function ChainList() {
+  const { config, engine } = useWhiskContext();
+
+  return (
+    <ul>
+      {config.chains.map((chain) => (
+        <li key={chain}>
+          {chain}
+          {chain === engine.config.defaultSourceChain
+            ? " (default source)"
+            : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`config` is the provider prop as you passed it. `engine.config` is what the
+engine was built from, with defaults filled in (`feeBearer: "sender"`,
+`useForwarder: true`), and it does not change after the first mount.
+
+Both hooks throw a `ConfigError` when called outside `<WhiskProvider>`, with a
+message that says to wrap the tree in the provider.

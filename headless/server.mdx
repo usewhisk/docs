@@ -1,0 +1,261 @@
+---
+title: Running the engine on a server
+sidebarTitle: Server
+description: Send USDC from Node with a key you hold, keep transfers on disk, and avoid paying anyone twice.
+---
+
+On a server the engine signs with a key your service holds, for payouts,
+refunds and treasury moves that no user approves in a wallet. The engine is
+the same `@usewhisk/core` as in the browser; what changes is who holds the key
+and what happens when the process dies mid-transfer.
+
+```ts payout.ts
+import { createWalletClient, http, type Hex } from "viem";
+import { nonceManager, privateKeyToAccount } from "viem/accounts";
+import { arcTestnet } from "viem/chains";
+import { createWhisk } from "@usewhisk/core";
+import { toEvmAdapter } from "./adapter.js";
+import { createFileInflightStore } from "./store.js";
+
+declare const db: {
+  claimPayout(id: string): Promise<boolean>;
+  releasePayout(id: string): Promise<void>;
+  recordPayout(
+    id: string,
+    result: { burnTx?: string; mintTx?: string; error?: string },
+  ): Promise<void>;
+};
+
+const key = process.env.PAYOUT_PRIVATE_KEY;
+if (!key) throw new Error("PAYOUT_PRIVATE_KEY is not set.");
+
+const account = privateKeyToAccount(key as Hex, { nonceManager });
+const wallet = createWalletClient({
+  account,
+  chain: arcTestnet,
+  transport: http(process.env.ARC_RPC_URL),
+});
+const adapter = toEvmAdapter(wallet, process.env.ARC_RPC_URL);
+
+const engine = createWhisk({
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  inflightStore: createFileInflightStore("./data/whisk-inflight.json"),
+  ...(process.env.ARC_RPC_URL && {
+    rpcUrls: { Arc_Testnet: process.env.ARC_RPC_URL },
+  }),
+});
+
+export async function payout(id: string, to: string, amount: string) {
+  if (!(await db.claimPayout(id))) return;
+
+  const recipient = await engine.resolve(to, "Base_Sepolia");
+  const quote = await engine.quote({
+    sourceChain: "Arc_Testnet",
+    destinationChain: "Base_Sepolia",
+    recipient,
+    amount,
+    adapter,
+  });
+
+  let burnTx: string | undefined;
+  let result;
+  try {
+    result = await engine.send(
+      { quote, adapter, metadata: { payoutId: id } },
+      { onBurnSubmitted: (hash) => (burnTx = hash) },
+    );
+  } catch (err) {
+    // No burn means no USDC left the wallet, so the payout can run again.
+    if (!burnTx) await db.releasePayout(id);
+    throw err;
+  }
+
+  await db.recordPayout(id, {
+    ...(burnTx && { burnTx }),
+    ...(result.kind === "success"
+      ? { ...(result.finalTxHash && { mintTx: result.finalTxHash }) }
+      : { error: result.error.message }),
+  });
+}
+```
+
+This builds on the viem adapter from [the core engine](/headless/core-engine)
+and the file store below. The runnable version is
+[`examples/node-headless`](https://github.com/usewhisk/whisk/tree/main/examples/node-headless)
+in the Whisk repo, with scripts for a send, a payroll loop, a refund and a
+receipt watcher.
+
+## Keys
+
+- Read the key from the environment or a secret manager at startup, and fail
+  if it is missing. Never log it, and never put it in metadata: metadata is
+  echoed in results and may reach your logs.
+- Use a dedicated payout wallet holding only what the next payouts need, not
+  your treasury.
+- Use viem's `nonceManager` on the account so sends from the same key in one
+  process do not reuse a nonce. Sends from several processes with one key can
+  still collide; run payouts from one worker, or one key per worker.
+- The wallet pays gas on the source chain: ETH on most EVM chains, USDC on
+  Arc. On Arc the engine keeps a gas reserve out of `maxSendable` and checks
+  for it before sending.
+
+## One adapter per chain
+
+A server adapter is pinned to the chain of its wallet client and refuses to
+switch. Build one per source chain. On a forwarded EVM to EVM bridge Circle
+submits the mint, so the source adapter is enough. When it does not (with
+`useForwarder: false`, or into a chain without forwarding), the engine signs
+the EVM mint with `destinationAdapter`, falling back to the source adapter,
+which then refuses to switch. Pass an adapter for the destination chain:
+
+```ts
+import {
+  createWhisk,
+  type EvmAdapter,
+  type ResolvedRecipient,
+} from "@usewhisk/core";
+
+const engine = createWhisk({
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  useForwarder: false,
+});
+
+const quote = await engine.quote({
+  sourceChain: "Arc_Testnet",
+  destinationChain: "Base_Sepolia",
+  recipient,
+  amount: "25.00",
+  adapter: arcAdapter,
+  destinationAdapter: baseAdapter,
+});
+await engine.send({
+  quote,
+  adapter: arcAdapter,
+  destinationAdapter: baseAdapter,
+});
+```
+
+## Keep in-flight transfers on disk
+
+The engine records each bridge in its `inflightStore` before the wallet signs,
+and records the burn hash the moment the wallet returns it. The default store
+is in memory, so a crash or a deploy between burn and mint forgets the
+transfer. The USDC is not lost, since Circle's attestation still exists, but
+you would have to find the burn hash yourself. Give the engine a store that
+survives restarts.
+
+`InflightStore` is three async methods over JSON-safe records (amounts are
+subunit strings):
+
+```ts store.ts
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import type { InflightRecord, InflightStore } from "@usewhisk/core";
+
+export function createFileInflightStore(path: string): InflightStore {
+  let queue: Promise<unknown> = Promise.resolve();
+
+  async function load(): Promise<Record<string, InflightRecord>> {
+    try {
+      return JSON.parse(await readFile(path, "utf8")) as Record<
+        string,
+        InflightRecord
+      >;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw err;
+    }
+  }
+
+  async function save(records: Record<string, InflightRecord>) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(`${path}.tmp`, JSON.stringify(records, null, 2));
+    await rename(`${path}.tmp`, path);
+  }
+
+  // One write at a time, so two updates to the same file never interleave.
+  function serial<T>(task: () => Promise<T>): Promise<T> {
+    const next = queue.then(task);
+    queue = next.catch(() => undefined);
+    return next;
+  }
+
+  return {
+    put: (record) =>
+      serial(async () => {
+        const records = await load();
+        records[record.id] = record;
+        await save(records);
+      }),
+    list: () =>
+      serial(async () =>
+        Object.values(await load()).sort((a, b) => a.createdAt - b.createdAt),
+      ),
+    remove: (id) =>
+      serial(async () => {
+        const records = await load();
+        delete records[id];
+        await save(records);
+      }),
+  };
+}
+```
+
+A file works for a single worker. With several, use your database: a table
+keyed by `id` holding the record as JSON. Writes for one transfer arrive in
+order, so a plain upsert is enough.
+
+On startup, finish what the last process left:
+
+```ts resume-on-boot.ts
+import { createWhisk } from "@usewhisk/core";
+import { createFileInflightStore } from "./store.js";
+
+const engine = createWhisk({
+  chains: ["Arc_Testnet", "Base_Sepolia"],
+  inflightStore: createFileInflightStore("./data/whisk-inflight.json"),
+});
+
+for (const record of await engine.inflight()) {
+  if (record.step === "minted") {
+    await engine.dismiss(record.id);
+  } else if (record.sourceTxHash) {
+    const result = await engine.resume(record);
+    console.log(record.id, result.kind);
+    if (result.kind === "success") await engine.dismiss(record.id);
+  } else {
+    console.warn(
+      `${record.id} never recorded a burn. Check the wallet before dismissing it.`,
+    );
+  }
+}
+```
+
+A record stuck at `signing` has no burn hash. The process died between asking
+for the signature and getting the hash back, so the burn may or may not have
+been sent. Look up the wallet's transactions; if a burn is there, finish it
+with `engine.resumeFromTx({ sourceChain, txHash })`.
+
+## Do not pay twice
+
+Whisk does not deduplicate payouts. Each `send` with a fresh quote is a new
+transfer, and a retry after a timeout pays again. The payout above guards
+against that:
+
+1. **Claim before sending.** `claimPayout` marks the payout as taken in the
+   same transaction that checks it, so two workers or a retried job cannot both
+   send it.
+2. **Release only if nothing burned.** `send` throws for refusals before
+   signing, such as an expired quote, changed fees or a low balance. When it
+   throws and `onBurnSubmitted` never fired, no USDC left the wallet and the
+   payout can run again.
+3. **Never re-send after a burn.** If the result is a failure but a burn hash
+   exists, the money is in flight. Finish it with `resume`, not a new `send`.
+4. **Tag the transfer.** `metadata: { payoutId }` comes back on the result, so
+   logs and receipts tie to your records.
+
+## Watching without signing
+
+A worker that only reports status needs no key. `pollAttestation` and
+`deriveReceiptView` follow a transfer from its burn hash; see
+[receipts](/flows/receipts).

@@ -1,0 +1,521 @@
+---
+title: "Config"
+description: "createWhiskConfig, every WhiskClientConfig field, the wallet factories, resolvers, theme helpers and the Tailwind preset."
+---
+
+`createWhiskConfig` builds the object you pass to `<WhiskProvider config>`. The wallet factories (`evm`, `solana`, `stellar`, `starknet`) decide which wallet ecosystems the provider mounts.
+
+```tsx config.ts
+import { createWhiskConfig, evm, solana } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    evm({ chains: ["Base_Sepolia", "Arc_Testnet"], appName: "My App" }),
+    solana({ network: "devnet" }),
+  ],
+  chains: ["Base_Sepolia", "Arc_Testnet", "Solana_Devnet"],
+  defaultSourceChain: "Base_Sepolia",
+  defaultDestinationChain: "Arc_Testnet",
+});
+```
+
+## createWhiskConfig
+
+```ts
+function createWhiskConfig(
+  options: CreateWhiskConfigOptions,
+): WhiskClientConfig;
+```
+
+Checks the options and returns them as a frozen `WhiskClientConfig`. `CreateWhiskConfigOptions` is the same type as `WhiskClientConfig`.
+
+It throws a `ConfigError` (code `CONFIG_ERROR`) when:
+
+- `wallets` is missing or empty.
+- `chains` is missing or empty.
+- `defaultSourceChain` is set and is not in `chains`.
+- `defaultDestinationChain` is set and is not in `chains`.
+
+It does not check that the chains in `chains` belong to the same network, or that each chain has a matching wallet factory. Build the config once, outside your components: `<WhiskProvider>` creates its engine on mount and does not pick up a new config afterwards.
+
+## WhiskClientConfig
+
+`<WhiskProvider>` passes most of these fields to `createWhisk` from `@usewhisk/core`. See [createWhisk](/reference/core/create-whisk) for how the engine uses them.
+
+<ParamField path="wallets" type="WalletAdapterFactory[]" required>
+  One factory per wallet ecosystem: `evm()`, `solana()`, `stellar()`, `starknet()`. The provider mounts an ecosystem's wallet context only when its factory is here, and `<ConnectModal>` shows the other ecosystems as disabled. If two factories share a `kind`, the first one wins.
+</ParamField>
+
+<ParamField path="chains" type="Chain[]" required>
+  The chains the widget offers, as chain ids such as `"Base"`, `"Arc_Testnet"` or `"Solana_Devnet"`. `<WhiskSend>` lists them in its chain pickers and only offers destinations on the same network as the source. The engine itself does not restrict quotes to this list. See [Chains](/chains) for every id.
+</ParamField>
+
+<ParamField path="defaultSourceChain" type="Chain">
+  The source chain `<WhiskSend>` starts on. Must be in `chains`. Defaults to the first entry of `chains`. A `defaultSourceChain` or `sourceChain` prop on `<WhiskSend>` wins over it.
+</ParamField>
+
+<ParamField path="defaultDestinationChain" type="Chain">
+  The destination chain the Bridge tab starts on. Must be in `chains`. Defaults
+  to the first chain in `chains` that is not the source.
+</ParamField>
+
+<ParamField path="token" type="Token">
+  Accepted and passed to the engine, but it has no effect in 0.3: quotes default
+  to `"USDC"`, and CCTP only moves USDC. Tracked in
+  [usewhisk/whisk#155](https://github.com/usewhisk/whisk/issues/155).
+</ParamField>
+
+<ParamField path="resolver" type="Resolver">
+  Turns what the payer types in the recipient field into an address. Defaults to
+  `createDefaultResolver()`: raw addresses first, then ENS. See
+  [Resolvers](#resolvers) below and [Recipients](/concepts/recipients).
+</ParamField>
+
+<ParamField path="feePolicy" type="FeePolicy">
+  A merchant fee the payer pays on top of every transfer, split 90% to `recipient` and 10% to the Whisk treasury. `value` is a decimal USDC string such as `"0.25"`; `recipient` must be an EVM address. `bps` is accepted by the type but ignored. The fee transfers are only sent from EVM source wallets, with the burn in one atomic batch or after it has landed, never before. A payer who rejects a separate fee request still gets the transfer, so read `result.customFee` before you fulfil an order. See [when the fee is paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+  <Expandable title="FeePolicy">
+    <ParamField path="value" type="string">
+      Total fee in USDC, as a decimal string. Unset, `"0"` or unparseable means no fee.
+    </ParamField>
+    <ParamField path="bps" type="number">
+      Not supported. The engine ignores it.
+    </ParamField>
+    <ParamField path="recipient" type="string" required>
+      EVM address that receives the merchant's 90%. A non-EVM value makes `send` throw `ConfigError` before anything is signed.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="feeBearer" type={'"sender" | "receiver"'}>
+  Who absorbs the CCTP protocol and Forwarder fees on a bridge. Defaults to
+  `"sender"`: the burn is sized up so the recipient gets the full amount. With
+  `"receiver"`, the payer is debited exactly the amount and the recipient gets
+  the amount less fees. Same-chain sends have no protocol fees.
+</ParamField>
+
+<ParamField path="rpcUrls" type="Partial<Record<Chain, string | string[]>>">
+  RPC endpoints the engine tries, in order, before each chain's public defaults.
+  Used for balance reads, gas prices on Arc, the Standard minimum fee read, and
+  the mint checks during a resume. This does not configure the wallet's own
+  transport: pass `rpcUrls` to `evm()` for that. See [RPC](/rpc).
+</ParamField>
+
+<ParamField path="useForwarder" type="boolean">
+  Lets Circle's Forwarding Service submit the destination mint on bridges where
+  it can. Defaults to `true`. Set it to `false` and a connected wallet signs the
+  mint on the destination chain (the source wallet for an EVM to EVM bridge).
+</ParamField>
+
+<ParamField path="appLabel" type="string">
+  Stored on the config and passed to the engine. Nothing in 0.3 reads it.
+</ParamField>
+
+<ParamField path="inflightStore" type="InflightStore">
+  Where the engine keeps a bridge between the burn and the mint, so a reload can
+  resume it. Defaults to `createBrowserInflightStore()`, which uses
+  `localStorage`. See [InflightStore](/reference/core/types#inflight-records).
+</ParamField>
+
+### Engine options the React config does not expose
+
+`createWhisk` in `@usewhisk/core` takes three options that `WhiskClientConfig` has no field for yet, so a `<WhiskProvider>` engine always runs with their defaults:
+
+| Option              | Default in the provider            |
+| ------------------- | ---------------------------------- |
+| `forwarderFeeLevel` | `"high"`, or `"med"` into Ethereum |
+| `defaultMetadata`   | none                               |
+| `fetch`             | the global `fetch`                 |
+
+Tracked in [usewhisk/whisk#156](https://github.com/usewhisk/whisk/issues/156). Per-call `metadata` still works through `useWhisk().send`.
+
+## Wallet factories
+
+Each factory returns a `WalletAdapterFactory` with a `kind` and an opaque `config`. The union is:
+
+```ts
+type WalletAdapterFactory =
+  | EvmAdapterFactory // { kind: "evm"; config: unknown }
+  | SolanaAdapterFactory // { kind: "solana"; config?: unknown }
+  | StellarAdapterFactory // { kind: "stellar"; config: unknown }
+  | StarknetAdapterFactory; // { kind: "starknet"; config: unknown }
+```
+
+The `config` of `evm()` is a wagmi `Config`. The others hold the `SolanaConfig`, `StellarConfig` and `StarknetConfig` shapes below.
+
+```ts config.ts
+import { createWhiskConfig, evm, stellar, starknet } from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [
+    evm({
+      chains: ["Base", "Arc"],
+      projectId: "your-walletconnect-project-id",
+      rpcUrls: {
+        Base: ["https://base.example-rpc.com", "https://mainnet.base.org"],
+      },
+    }),
+    stellar({ network: "public" }),
+    starknet({ network: "mainnet" }),
+  ],
+  chains: ["Base", "Arc", "Stellar", "Starknet"],
+  rpcUrls: { Base: "https://base.example-rpc.com" },
+  feePolicy: {
+    value: "0.25",
+    recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  },
+  feeBearer: "sender",
+});
+```
+
+<Warning>
+  The Solana, Stellar and Starknet factories default to their test networks.
+  Pass `network` for mainnet, or the wallet will be checked against the wrong
+  network.
+</Warning>
+
+### evm
+
+```ts
+function evm(options?: EvmFactoryOptions): EvmAdapterFactory;
+```
+
+Builds a wagmi config with the injected, Coinbase Wallet and (with a `projectId`) WalletConnect connectors, and `ssr: true`. If a `<WagmiProvider>` is already mounted above `<WhiskProvider>`, the provider uses that one and ignores this config.
+
+<ParamField path="chains" type="Chain[]">
+  EVM chains the wallet may connect to and switch between. Defaults to
+  `["Arc_Testnet", "Ethereum_Sepolia", "Base_Sepolia"]`. Chains the factory has
+  no wagmi chain for are dropped: in 0.3 that is Edge, Injective, Morph, Pharos,
+  Cronos, Plasma and X Layer (mainnet and testnet). If nothing is left, it falls
+  back to Ethereum Sepolia, because wagmi needs at least one chain.
+</ParamField>
+
+<ParamField path="projectId" type="string">
+  WalletConnect Cloud project id. Without it the WalletConnect connector is left
+  out.
+</ParamField>
+
+<ParamField path="rpcUrls" type="Partial<Record<Chain, string | string[]>>">
+  The wallet's RPC transport per chain. A string is a single `http` transport;
+  an array becomes a viem `fallback` ranked by latency. Chains without an entry
+  use viem's default public RPC.
+</ParamField>
+
+<ParamField path="appName" type="string">
+  Shown in the WalletConnect and Coinbase Wallet pairing dialogs. Defaults to
+  `"Whisk"`.
+</ParamField>
+
+### solana
+
+```ts
+function solana(options?: SolanaFactoryOptions): SolanaAdapterFactory;
+```
+
+Mounts `@solana/wallet-adapter-react` with no bundled wallet adapters; wallets announce themselves through Wallet Standard.
+
+<ParamField path="network" type={'"mainnet-beta" | "devnet" | "testnet"'}>
+  `SolanaNetwork`. Defaults to `"devnet"`. `useSolanaAdapter` reports any value
+  other than `"mainnet-beta"` as the `devnet` cluster.
+</ParamField>
+
+<ParamField path="endpoint" type="string">
+  Solana RPC endpoint. Defaults to the public endpoint for the network
+  (`https://api.mainnet-beta.solana.com`, `https://api.devnet.solana.com` or
+  `https://api.testnet.solana.com`), which is rate limited.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Reconnect the last wallet on load. Defaults to `false`.
+</ParamField>
+
+`SolanaConfig` is the resolved shape: `{ network: SolanaNetwork; endpoint: string; autoConnect: boolean }`.
+
+### stellar
+
+```ts
+function stellar(options?: StellarFactoryOptions): StellarAdapterFactory;
+```
+
+Stellar wallets come from `@creit.tech/stellar-wallets-kit`.
+
+<ParamField path="network" type={'"public" | "testnet"'}>
+  `StellarNetwork`. Defaults to `"testnet"`.
+</ParamField>
+
+<ParamField path="rpcUrl" type="string">
+  Soroban RPC URL. Defaults to `https://mainnet.sorobanrpc.com` on `public` and
+  `https://soroban-testnet.stellar.org` on `testnet`.
+</ParamField>
+
+<ParamField path="networkPassphrase" type="string">
+  Defaults to `"Public Global Stellar Network ; September 2015"` or `"Test SDF
+  Network ; September 2015"`.
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Reserved. Defaults to `false`; `<WhiskProvider>` does not read it.
+</ParamField>
+
+`StellarConfig` is the resolved shape: `{ network: StellarNetwork; networkPassphrase: string; rpcUrl: string; autoConnect: boolean }`.
+
+### starknet
+
+```ts
+function starknet(options?: StarknetFactoryOptions): StarknetAdapterFactory;
+```
+
+Starknet wallets come from `@starknet-io/get-starknet-core`. The RPC is polled to confirm transactions.
+
+<ParamField path="network" type={'"mainnet" | "sepolia"'}>
+  `StarknetNetwork`. Defaults to `"sepolia"`.
+</ParamField>
+
+<ParamField path="rpcUrl" type="string">
+  Starknet RPC. Defaults to the first public RPC of the `Starknet` or
+  `Starknet_Sepolia` chain entry.
+</ParamField>
+
+<ParamField path="chainId" type="string">
+  Chain id felt compared with the wallet's. Defaults to `0x534e5f4d41494e`
+  (`SN_MAIN`) or `0x534e5f5345504f4c4941` (`SN_SEPOLIA`).
+</ParamField>
+
+<ParamField path="autoConnect" type="boolean">
+  Reserved. Defaults to `false`; `<WhiskProvider>` does not read it.
+</ParamField>
+
+`StarknetConfig` is the resolved shape: `{ network: StarknetNetwork; chainId: string; rpcUrl: string; autoConnect: boolean }`.
+
+## createBrowserInflightStore
+
+```ts
+function createBrowserInflightStore(): InflightStore;
+```
+
+The default `inflightStore`. It returns a store backed by `localStorage` when the page can write to it, and an in-memory store otherwise (server rendering, Safari private browsing). The memory store lasts until the page closes, so a reload in those cases loses the record of a transfer between burn and mint. The burn hash still lets you finish it with `resumeFromTx`. Records are kept under `whisk:inflight:<id>`.
+
+Only the main `@usewhisk/react` entry exports it; `@usewhisk/react/headless` does not.
+
+## Resolvers
+
+```ts config.ts
+import {
+  composeResolvers,
+  addressResolver,
+  createBrowserInflightStore,
+  createEnsResolver,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+export const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Arc_Testnet", "Ethereum_Sepolia", "Base_Sepolia"],
+  resolver: composeResolvers([
+    addressResolver,
+    createEnsResolver({
+      chain: "sepolia",
+      rpcUrl: "https://sepolia.example-rpc.com",
+    }),
+  ]),
+  inflightStore: createBrowserInflightStore(),
+});
+```
+
+### createDefaultResolver
+
+```ts
+function createDefaultResolver(
+  options?: CreateDefaultResolverOptions,
+): Resolver;
+const defaultResolver: Resolver; // createDefaultResolver()
+```
+
+Raw addresses first, then ENS. For a testnet destination it tries Sepolia ENS, then mainnet ENS; for a mainnet destination, mainnet ENS only. `CreateDefaultResolverOptions` is `EnsResolverOptions` without `chain`, and applies to every ENS resolver inside.
+
+```ts
+import { createDefaultResolver } from "@usewhisk/react";
+
+export const resolver = createDefaultResolver({
+  rpcUrl: [
+    "https://eth.example-rpc.com",
+    "https://ethereum-rpc.publicnode.com",
+  ],
+  fallbackToEthAddress: false,
+});
+```
+
+### createEnsResolver
+
+```ts
+function createEnsResolver(options?: EnsResolverOptions): Resolver;
+const ensResolver: Resolver; // mainnet ENS
+const sepoliaEnsResolver: Resolver; // Sepolia ENS
+```
+
+Matches any input ending in `.<tld>` and looks the name up on Ethereum L1 with ENSIP-11 coin types: 60 for Ethereum, `0x80000000 | chainId` for other EVM chains, 501 for Solana. Stellar and Starknet have no coin type, so the resolver returns `null` for them without a lookup. Returns `null` when the name has no usable address. An RPC failure throws `ResolverError`.
+
+<Warning>
+  Use `@usewhisk/react` 0.3.0 or later. Before 0.3.1 an ENS name resolved to its
+  Ethereum address for a Starknet destination, which is not the owner's Starknet
+  account. Up to 0.2.1 it was accepted; from 0.2.2 the quote refuses it, before
+  the burn.
+</Warning>
+
+<ParamField path="chain" type={'"mainnet" | "sepolia"'}>
+  `EnsResolverChain`: which ENS deployment to query. Defaults to `"mainnet"`.
+</ParamField>
+
+<ParamField path="rpcUrl" type="string | string[]">
+  One URL, or several tried through viem's `fallback` ranked by latency. An
+  empty array uses the defaults. Defaults to `DEFAULT_ENS_RPC_URLS` or
+  `DEFAULT_ENS_SEPOLIA_RPC_URLS`, public endpoints chosen because they allow
+  browser CORS.
+</ParamField>
+
+<ParamField path="client" type="PublicClient">
+  A viem public client to reuse. When set, `rpcUrl` is ignored.
+</ParamField>
+
+<ParamField path="fallbackToEthAddress" type="boolean">
+  For an EVM destination other than Ethereum, use the name's Ethereum (coin type
+  60) address when it has none for the destination chain. Defaults to `true`.
+</ParamField>
+
+`addressResolver` and `composeResolvers` come from `@usewhisk/core` and are documented under [Resolver](/reference/core/types#resolvers).
+
+## Theme
+
+`<WhiskProvider theme>` takes a `WhiskThemeInput`. These helpers are what the provider uses to turn it into CSS variables, exported for palette pickers and server rendering. Only the main `@usewhisk/react` entry exports them. See [Tokens](/theming/tokens) for every variable.
+
+```ts
+import {
+  getThemePreset,
+  listThemeNames,
+  resolveTheme,
+  themeToCssVars,
+  tokensToCssVars,
+  type WhiskTheme,
+} from "@usewhisk/react";
+
+const names = listThemeNames();
+const wine: WhiskTheme = getThemePreset("wine");
+const vars = themeToCssVars({ ...wine, primary: "#2b3cff" });
+const partial = tokensToCssVars({ radius: "4px", font: "Inter, sans-serif" });
+const resolved = resolveTheme({
+  preset: "dark",
+  tokens: { primary: "#2b3cff" },
+});
+```
+
+| Export            | Signature                                                        | Returns                                                                                                                                                                             |
+| ----------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `themePresets`    | `Record<WhiskThemeName, WhiskTheme>`                             | The six built-in palettes.                                                                                                                                                          |
+| `getThemePreset`  | `(name: WhiskThemeName) => WhiskTheme`                           | One preset.                                                                                                                                                                         |
+| `listThemeNames`  | `() => WhiskThemeName[]`                                         | `["light", "dark", "wine", "indigo", "emerald", "monochrome"]`.                                                                                                                     |
+| `resolveTheme`    | `(input: WhiskThemeInput \| undefined) => ResolvedTheme \| null` | `null` for `undefined` or `"auto"`. For `"light"` and `"dark"`, only the colour mode (their values are in `styles.css`). Otherwise the colour mode and the variables to set inline. |
+| `themeToCssVars`  | `(theme: WhiskTheme) => Record<string, string>`                  | `--whisk-*` variables for a full theme. `cardFg` defaults to `fg`, `ring` to `primary`; other unset optional tokens are left out.                                                   |
+| `tokensToCssVars` | `(tokens: WhiskThemeTokens) => Record<string, string>`           | Variables for whichever tokens are set.                                                                                                                                             |
+
+### Theme types
+
+<ResponseField
+  name="WhiskThemeName"
+  type={'"light" | "dark" | "wine" | "indigo" | "emerald" | "monochrome"'}
+>
+  The built-in palette names.
+</ResponseField>
+
+<ResponseField name="WhiskColorMode" type={'"light" | "dark"'}>
+  Sets the `data-whisk-theme` attribute and, for `"dark"`, the `dark` class on
+  the root element.
+</ResponseField>
+
+<ResponseField name="WhiskThemeInput" type={'WhiskThemeName | "auto" | WhiskTheme | WhiskThemeOverrides'}>
+  What `<WhiskProvider theme>` accepts. `"auto"` follows `prefers-color-scheme` in CSS alone, so it renders the same on the server.
+</ResponseField>
+
+<ResponseField
+  name="WhiskThemeOverrides"
+  type="{ preset: WhiskThemeName | 'auto'; tokens: WhiskThemeTokens }"
+>
+  A preset, or `"auto"`, with some tokens replaced.
+</ResponseField>
+
+<ResponseField
+  name="WhiskThemeTokens"
+  type={'Partial<Omit<WhiskTheme, "colorMode">>'}
+>
+  Any subset of a theme's tokens.
+</ResponseField>
+
+<ResponseField name="ResolvedTheme" type="{ colorMode?: WhiskColorMode; vars: Record<string, string> }">
+  The output of `resolveTheme`. `colorMode` is absent for `{ preset: "auto" }`.
+</ResponseField>
+
+<ResponseField name="WhiskTheme" type="object">
+  A full theme.
+
+  <Expandable title="WhiskTheme">
+    <ResponseField name="colorMode" type="WhiskColorMode" required>Light or dark.</ResponseField>
+    <ResponseField name="bg" type="string" required>`--whisk-bg`, the widget background.</ResponseField>
+    <ResponseField name="fg" type="string" required>`--whisk-fg`, primary text.</ResponseField>
+    <ResponseField name="border" type="string" required>`--whisk-border`.</ResponseField>
+    <ResponseField name="input" type="string" required>`--whisk-input`, input background.</ResponseField>
+    <ResponseField name="card" type="string" required>`--whisk-card`.</ResponseField>
+    <ResponseField name="cardFg" type="string">`--whisk-card-fg`. Defaults to `fg`.</ResponseField>
+    <ResponseField name="primary" type="string" required>`--whisk-primary`, buttons and accents.</ResponseField>
+    <ResponseField name="primaryFg" type="string" required>`--whisk-primary-fg`.</ResponseField>
+    <ResponseField name="success" type="string" required>`--whisk-success`.</ResponseField>
+    <ResponseField name="warning" type="string" required>`--whisk-warning`.</ResponseField>
+    <ResponseField name="destructive" type="string" required>`--whisk-destructive`.</ResponseField>
+    <ResponseField name="destructiveFg" type="string" required>`--whisk-destructive-fg`.</ResponseField>
+    <ResponseField name="fgMuted" type="string">`--whisk-fg-muted`. The stylesheet derives it from `fg` when unset.</ResponseField>
+    <ResponseField name="ring" type="string">`--whisk-ring`, the focus ring. Defaults to `primary`.</ResponseField>
+    <ResponseField name="radius" type="string">`--whisk-radius`, fields and buttons.</ResponseField>
+    <ResponseField name="radiusSm" type="string">`--whisk-radius-sm`.</ResponseField>
+    <ResponseField name="radiusMd" type="string">`--whisk-radius-md`.</ResponseField>
+    <ResponseField name="radiusLg" type="string">`--whisk-radius-lg`, cards.</ResponseField>
+    <ResponseField name="borderWidth" type="string">`--whisk-border-w`.</ResponseField>
+    <ResponseField name="font" type="string">`--whisk-font`.</ResponseField>
+    <ResponseField name="fontDisplay" type="string">`--whisk-font-display`.</ResponseField>
+    <ResponseField name="fontMono" type="string">`--whisk-font-mono`.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Tailwind preset
+
+`@usewhisk/react/tailwind` exports `whiskTheme(options?: WhiskThemeOptions)`, also as the default export. It maps the `--whisk-*` variables to Tailwind colours (`whisk-bg`, `whisk-fg`, `whisk-fg-muted`, `whisk-card`, `whisk-card-fg`, `whisk-border`, `whisk-input`, `whisk-ring`, `whisk-primary`, `whisk-primary-fg`, `whisk-success`, `whisk-warning`, `whisk-destructive`, `whisk-destructive-fg`), radii (`whisk`, `whisk-sm`, `whisk-lg`) and fonts (`whisk`, `whisk-mono`). The variables themselves still come from `styles.css`.
+
+```ts tailwind.config.ts
+import { whiskTheme } from "@usewhisk/react/tailwind";
+
+export default {
+  presets: [whiskTheme({ prefix: "whisk" })],
+  content: ["./src/**/*.{ts,tsx}"],
+};
+```
+
+<ParamField path="prefix" type="string">
+  Prefix for every generated key. Defaults to `"whisk"`.
+</ParamField>
+
+See [Tailwind](/theming/tailwind).
+
+## Entry points
+
+| Entry                        | Contents                                                                                                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@usewhisk/react`            | Everything on the React reference pages, plus the `@usewhisk/core` re-exports below.                                                                             |
+| `@usewhisk/react/headless`   | The provider, config builders, wallet factories, hooks, resolvers and core re-exports. No components, no theme helpers, no `createBrowserInflightStore`, no CSS. |
+| `@usewhisk/react/tailwind`   | `whiskTheme` and `WhiskThemeOptions`.                                                                                                                            |
+| `@usewhisk/react/styles.css` | The widget stylesheet.                                                                                                                                           |
+
+Both JavaScript entries re-export these from `@usewhisk/core`, documented there:
+
+- Engine types: `WhiskEngine`, `WhiskAdapter`, `EvmAdapter`, `EvmCall`, `CallReceipt`, `SendCallsOptions`, `SendCallsResult`, `QuoteParams`, `SendParams`, `SendListeners`, `SendStepListener`, `SendResult`, `SendSuccess`, `SendFailure`, `MaxSendable`, `ResumeOptions`, `ResumeFromTxParams`, `RefundParams`, `RefundResult`. See [Engine](/reference/core/engine).
+- Errors: every error class, `toWhiskError`, `cleanErrorMessage`, `WhiskErrorCode`, `WhiskErrorCategory`, `WhiskErrorOptions`, `RouteUnavailableReason`. See [Errors](/reference/core/errors).
+- Types, helpers and constants: `Chain`, `ChainKind`, `ChainNetwork`, `Token`, `Quote`, `Route`, `RouteMint`, `RoutePlan`, `Step`, `StepName`, `StepState`, `FeeBearer`, `FeeBreakdown`, `FeeEntry`, `FeeEntryKind`, `FeePolicy`, `Resolver`, `ResolvedRecipient`, `WhiskConfig`, `WhiskState`, `WhiskStateKind`, `DEFAULT_FEE_BEARER`, `DEFAULT_TOKEN`, `isBridgeRoute`, `isSendRoute`, `planRoute`, `addressResolver`, `composeResolvers`, the fee, chain, metadata, refund, receipt and Iris helpers, and `formatUsdcAmount`, `parseUsdcAmount`, `USDC_DECIMALS`. See [Types](/reference/core/types).
+
+`createWhisk`, the inflight store constructors, the state reducer, the non-EVM adapter types, `StellarTrustline`, `CustomFeeOutcome`, `decideRoute`, `connectedEcosystems`, `SOLANA_MESSAGE_TRANSMITTER`, `getStarknetTransactionStatus` and the webhook signing helpers are only in `@usewhisk/core`.

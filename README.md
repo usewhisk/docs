@@ -5,13 +5,16 @@ reference and the API reference for Whisk, the stablecoin payments SDK.
 
 ## Status
 
-Being set up. The Mintlify site, the port of the existing docs and the rewrite are
-tracked in [the issues](https://github.com/usewhisk/docs/issues):
+The site covers `@usewhisk/react` and `@usewhisk/core` 0.3.x and `@usewhisk/cctp` 0.1.x,
+ported from the old `apps/docs` and rewritten against the published code. The API
+reference tab arrives with the platform's OpenAPI spec.
 
-- [#1](https://github.com/usewhisk/docs/issues/1) Mintlify at `docs.usewhisk.xyz`;
-- [#2](https://github.com/usewhisk/docs/issues/2) port the current docs out of
-  `usewhisk/whisk`;
-- [#3](https://github.com/usewhisk/docs/issues/3) rewrite for the new surfaces.
+## Run it locally
+
+```bash
+pnpm install
+npx mint@4.2.993 dev   # http://localhost:3000
+```
 
 ## How the site is built
 
@@ -27,7 +30,7 @@ restructure starts with an issue.
 
 ```bash
 pnpm install   # installs the git hooks
-pnpm preflight
+pnpm preflight # format, shellcheck, Mintlify build, broken links
 ```
 
 You also need `brew install gitleaks shellcheck`. Read the

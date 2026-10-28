@@ -1,0 +1,168 @@
+---
+title: Invoice link
+description: A shareable payment link that carries the recipient, amount and chain in its query string and opens a locked WhiskSend.
+---
+
+The `invoice-link` example is a Next.js 15 app with two views. `/create` lets a
+freelancer compose a link; `/` reads it back and renders an invoice with a
+`<WhiskSend>` locked to its values. The link is the whole integration:
+
+```text
+/?to=0x5B8ecaB7096F8aBED873D246629ef9f05f467605&amount=1200.00&chain=Base_Sepolia&memo=Brand+refresh
+```
+
+Reading it, with the example's `useSearchParams` call replaced by a plain
+`URLSearchParams` argument:
+
+```ts parse-invoice.ts
+import { getChain, isChainId, type Chain } from "@usewhisk/react";
+
+export type InvoiceQuery =
+  | {
+      valid: true;
+      to: string;
+      amount: string;
+      chain: Chain;
+      chainLabel: string;
+      memo: string;
+    }
+  | {
+      valid: false;
+      reason: "missing-to" | "missing-amount" | "unknown-chain" | "missing";
+    };
+
+export function parseInvoice(params: URLSearchParams): InvoiceQuery {
+  const to = params.get("to")?.trim() ?? "";
+  const amount = params.get("amount")?.trim() ?? "";
+  const chain = params.get("chain")?.trim() ?? "";
+  const memo = params.get("memo")?.trim() ?? "";
+
+  if (!to && !amount && !chain) return { valid: false, reason: "missing" };
+  if (!to) return { valid: false, reason: "missing-to" };
+  if (!amount) return { valid: false, reason: "missing-amount" };
+  if (!isChainId(chain)) return { valid: false, reason: "unknown-chain" };
+
+  return {
+    valid: true,
+    to,
+    amount,
+    chain,
+    chainLabel: getChain(chain).label,
+    memo,
+  };
+}
+```
+
+And paying it, from `src/components/pay-aside.tsx`:
+
+```tsx pay-panel.tsx
+"use client";
+
+import { WhiskSend } from "@usewhisk/react";
+import type { InvoiceQuery } from "./parse-invoice";
+
+type ValidInvoice = Extract<InvoiceQuery, { valid: true }>;
+
+export function PayPanel({
+  invoice,
+  onPaid,
+}: {
+  invoice: ValidInvoice;
+  onPaid: (txHash?: string) => void;
+}) {
+  return (
+    <WhiskSend
+      amount={invoice.amount}
+      recipient={invoice.to}
+      sourceChain={invoice.chain}
+      destinationChain={invoice.chain}
+      onSuccess={({ finalTxHash }) => onPaid(finalTxHash)}
+    />
+  );
+}
+```
+
+## How it works
+
+- **The link is untrusted input.** `isChainId` only passes a chain id Whisk
+  knows, so a tampered `chain` falls through to the empty state instead of
+  reaching the widget. A bad `to` fails in the widget's recipient check.
+- **Same-chain payment.** Source and destination are both the invoice's chain,
+  so the payer sends USDC on that chain directly. There are no bridge fees and
+  the freelancer receives exactly `amount`. The payer needs USDC on that chain.
+- **Paid stamp.** `onSuccess` stores the hash and the invoice card shows a
+  "Paid" stamp.
+- **Composer.** `/create` (`src/hooks/use-invoice-link.ts`) checks the address
+  is a 20-byte hex address and the amount is positive, then builds the path:
+
+```ts build-link.ts
+import type { Chain } from "@usewhisk/react";
+
+export function invoicePath(draft: {
+  to: string;
+  amount: string;
+  chain: Chain;
+  memo: string;
+}): string {
+  const search = new URLSearchParams();
+  search.set("to", draft.to.trim());
+  search.set("amount", draft.amount.trim());
+  search.set("chain", draft.chain);
+  if (draft.memo.trim()) search.set("memo", draft.memo.trim());
+  return `/?${search.toString()}`;
+}
+```
+
+The provider config (`src/app/providers.tsx`) lists Arc Testnet, Base Sepolia,
+Ethereum Sepolia, Arbitrum Sepolia and Optimism Sepolia, so an invoice can name
+any of them.
+
+## Run it locally
+
+From a clone of [usewhisk/whisk](https://github.com/usewhisk/whisk), with Node
+20 or later and pnpm:
+
+```bash
+pnpm install
+pnpm build
+cp examples/invoice-link/.env.example examples/invoice-link/.env.local
+pnpm --filter @usewhisk/example-invoice-link dev
+```
+
+Open http://localhost:3014 and pick one of the demo invoices, or compose one at
+http://localhost:3014/create.
+
+| Variable                               | Required | Effect                                                                                         |
+| -------------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` | No       | Adds the WalletConnect connector. Without it, injected wallets and Coinbase Wallet still work. |
+
+## For production
+
+<Warning>
+  Anyone holding the link can edit it. Change `amount=1200.00` to `amount=1.00`
+  and the widget locks to $1. A query-string invoice says what to pay, never
+  what was owed.
+</Warning>
+
+- **Keep invoices on your server.** Put only an invoice id in the link and load
+  the recipient, amount and chain from your database, or sign the parameters
+  with an HMAC and check the signature before rendering.
+- **Verify payment on your server.** Mark an invoice paid only after checking
+  the transfer on chain against the stored amount and recipient, as in
+  [checkout](/flows/checkout#verify-on-your-server). The "Paid" stamp is only
+  the payer's browser.
+- **Validate the amount.** The customer view passes `amount` straight to the
+  widget. Run it through `parseUsdcAmount`, which throws on anything that is
+  not a positive decimal USDC string, and reject links with more than 6
+  decimals, which it would silently truncate.
+- **Allow other source chains if you want them.** Drop `sourceChain`, keep
+  `destinationChain`, and pass `tabs={["bridge"]}`, so the payer can pay from
+  any chain on the same network and covers the bridge fees.
+- **Fix the explorer link.** `src/lib/order.ts` always links to Arc Testnet's
+  explorer. Use `explorerTxUrl(invoice.chain, hash)`.
+- **Drop the email promise.** The confirmation says "A receipt is on its way to
+  your email"; nothing sends one.
+- **Use mainnet chain ids** (`Arc`, `Base`, `Ethereum`, `Arbitrum`,
+  `Optimism`) in the config and in the links you generate.
+
+<Note>The example's README gives port 3030; the `dev` script uses 3014.</Note>

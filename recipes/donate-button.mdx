@@ -1,0 +1,166 @@
+---
+title: Donate button
+description: A donation page where the recipient and destination chain are fixed and the donor picks a tier or types an amount.
+---
+
+The `donate-button` example is a Vite and React landing page for a fictional
+reforestation charity, OpenForest. Donors pick a tier ($5, $25 or $100) or a
+custom amount and pay from an EVM wallet or Phantom on Solana. The treasury
+always receives on Optimism Sepolia, with the donor covering the bridge fees.
+
+```tsx donate-card.tsx
+import { useState } from "react";
+import { WhiskSend } from "@usewhisk/react";
+
+const TREASURY_ADDRESS = "0xbe03CE9d6001D27BE41fc87e3E3f777d04e70Fe2";
+const TIERS = ["5", "25", "100"];
+
+export function DonateCard() {
+  const [tier, setTier] = useState<string | undefined>("25");
+  const [paidTx, setPaidTx] = useState<string | null>(null);
+
+  if (paidTx !== null)
+    return <p>Thank you. Transaction: {paidTx || "pending"}</p>;
+
+  return (
+    <div>
+      {TIERS.map((amount) => (
+        <button key={amount} onClick={() => setTier(amount)}>
+          ${amount}
+        </button>
+      ))}
+      <button onClick={() => setTier(undefined)}>Custom</button>
+
+      <WhiskSend
+        recipient={TREASURY_ADDRESS}
+        destinationChain="Optimism_Sepolia"
+        amount={tier}
+        onSuccess={({ finalTxHash }) => setPaidTx(finalTxHash ?? "")}
+      />
+    </div>
+  );
+}
+```
+
+This is a trimmed version of `src/components/donate-card.tsx` and
+`src/hooks/use-donation.ts`. The full example adds a hero, a donor wall and a
+project grid, all static data.
+
+## How it works
+
+- **Tier or custom.** A tier passes `amount`, which locks the amount field.
+  "Custom" passes `undefined`, which hands the field back to the donor. Switching
+  between them is just changing one prop.
+- **Fixed recipient and chain.** `recipient` and `destinationChain` are locked,
+  so a donor cannot redirect the gift.
+- **Any source.** The config lists four EVM testnets and Solana Devnet. A
+  Solana donor's USDC is burned on Solana and minted to the EVM treasury on
+  Optimism Sepolia through CCTP.
+- **Donor pays the fees.** `feeBearer: "sender"` sizes the burn up so a $25
+  tier lands as at least $25. The donor sees the total before signing.
+- **Thank-you.** `onSuccess` swaps the widget for a thank-you with the final
+  tx hash. `finalTxHash` can be undefined when Circle's Forwarder minted and
+  did not report its hash, so the example falls back to an empty string.
+
+The provider, from `src/providers.tsx`:
+
+```tsx providers.tsx
+import { useMemo, type ReactNode } from "react";
+import { WhiskProvider, createWhiskConfig, evm, solana } from "@usewhisk/react";
+
+export function Providers({ children }: { children: ReactNode }) {
+  const config = useMemo(
+    () =>
+      createWhiskConfig({
+        feeBearer: "sender",
+        wallets: [
+          evm({
+            chains: [
+              "Arc_Testnet",
+              "Base_Sepolia",
+              "Ethereum_Sepolia",
+              "Optimism_Sepolia",
+            ],
+            projectId: import.meta.env.VITE_WALLETCONNECT_PROJECT_ID,
+            appName: "OpenForest",
+          }),
+          solana({ network: "devnet" }),
+        ],
+        chains: [
+          "Arc_Testnet",
+          "Base_Sepolia",
+          "Ethereum_Sepolia",
+          "Optimism_Sepolia",
+          "Solana_Devnet",
+        ],
+        defaultSourceChain: "Arc_Testnet",
+        defaultDestinationChain: "Optimism_Sepolia",
+        appLabel: "whisk-example-donate",
+      }),
+    [],
+  );
+
+  return (
+    <WhiskProvider config={config} theme="light">
+      {children}
+    </WhiskProvider>
+  );
+}
+```
+
+The treasury receives on Optimism rather than Ethereum because the Forwarder's
+mint fee there is cents, where an Ethereum mint costs dollars.
+
+## Run it locally
+
+From a clone of [usewhisk/whisk](https://github.com/usewhisk/whisk), with Node
+20 or later and pnpm:
+
+```bash
+pnpm install
+pnpm build
+cp examples/donate-button/.env.example examples/donate-button/.env.local
+pnpm --filter @usewhisk/example-donate-button dev
+```
+
+Open http://localhost:3011. `pnpm build` builds the packages the example
+imports from the workspace.
+
+| Variable                        | Required | Effect                                                                                         |
+| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `VITE_WALLETCONNECT_PROJECT_ID` | No       | Adds the WalletConnect connector. Without it, injected wallets and Coinbase Wallet still work. |
+
+You need testnet USDC on one of the listed chains (Circle's faucet) and a
+little native gas, except on Arc Testnet, where gas is paid in USDC.
+
+To use it in your own Vite app, install `@usewhisk/react`, import
+`@usewhisk/react/styles.css` before your own CSS (see `src/main.tsx`), and copy
+the `resolve.alias`, `define` and `optimizeDeps` blocks from `vite.config.ts`.
+They point `buffer` at the browser polyfill (the Solana and Stellar SDKs need
+it) and stub two wagmi dependencies that have no browser build.
+
+## For production
+
+- **Switch to mainnet chains.** Replace each `_Sepolia` and `_Devnet` id with
+  its mainnet id (`Arc`, `Base`, `Ethereum`, `Optimism`, `Solana`), use
+  `solana({ network: "mainnet-beta" })`, and lock `destinationChain` to a
+  mainnet chain. A mainnet donor quoted against a testnet destination gets
+  `NetworkMismatchError`.
+- **Use your treasury address**, and make sure it can receive on the
+  destination chain.
+- **Show only the Bridge tab** with `tabs={["bridge"]}`. With both tabs, the
+  Send tab pays the treasury on the donor's own source chain, not on Optimism.
+- **Record donations on your server.** The donor wall and totals are
+  hard-coded. If you publish donors or issue tax receipts, post the tx hashes
+  to your server and verify them on chain first, as in
+  [checkout](/flows/checkout#verify-on-your-server).
+- **Link the receipt** with `explorerTxUrl` or a
+  [receipt page](/flows/receipts) rather than a fixed explorer host.
+- **Set your own RPC URLs** with `rpcUrls` on the config and on `evm()`; the
+  public defaults are rate-limited.
+
+<Note>
+  The example's README says the treasury is pinned to Arc Testnet and the dev
+  server runs on port 5173. The code pins Optimism Sepolia and the `dev` script
+  uses port 3011.
+</Note>

@@ -1,0 +1,400 @@
+---
+title: "Hooks"
+description: "Signatures, parameters and return values of every hook @usewhisk/react exports."
+---
+
+Call these hooks inside `<WhiskProvider>`, which supplies the engine, the wallet contexts and a TanStack Query client. `useWhisk`, `useWhiskEngine`, `useWhiskContext`, `useRefund`, `useSolanaAdapter` and `useAdapterFor` throw `ConfigError` outside it. All of them are also exported from `@usewhisk/react/headless`.
+
+```tsx PayButton.tsx
+import { useWhisk } from "@usewhisk/react";
+
+export function PayButton() {
+  const { isConnected, resolve, quote, send, isSending, lastResult } =
+    useWhisk();
+
+  async function pay() {
+    const recipient = await resolve("vitalik.eth", "Base_Sepolia");
+    const q = await quote({
+      sourceChain: "Arc_Testnet",
+      destinationChain: "Base_Sepolia",
+      recipient,
+      amount: "10",
+    });
+    const result = await send(
+      { quote: q },
+      { onStep: (step) => console.log(step) },
+    );
+    if (result.kind === "failure") console.error(result.error.message);
+  }
+
+  return (
+    <button disabled={!isConnected || isSending} onClick={() => void pay()}>
+      {lastResult?.kind === "success" ? "Paid" : "Pay 10 USDC"}
+    </button>
+  );
+}
+```
+
+## useWhisk
+
+```ts
+function useWhisk(): UseWhiskResult;
+```
+
+The engine, the connected EVM wallet and send state, for custom widgets. It only knows the EVM wallet: for Solana, Stellar or Starknet sources, call the engine with the adapter from [useAdapterFor](#useadapterfor). Guide: [useWhisk](/hooks/use-whisk).
+
+<ResponseField name="engine" type="WhiskEngine">
+  The engine `<WhiskProvider>` created. See [Engine](/reference/core/engine).
+</ResponseField>
+
+<ResponseField name="adapter" type="EvmAdapter | null">
+  The connected wagmi account as an adapter, or `null` when no EVM wallet is
+  connected.
+</ResponseField>
+
+<ResponseField name="address" type="`0x${string}` | undefined">
+  The connected EVM address.
+</ResponseField>
+
+<ResponseField name="isConnected" type="boolean">
+  `true` while an EVM wallet is connected.
+</ResponseField>
+
+<ResponseField
+  name="resolve"
+  type="(input: string, chain: Chain) => Promise<ResolvedRecipient>"
+>
+  `engine.resolve`. Throws `ConfigError` when no resolver matches the input or
+  none returns an address, and `ResolverError` when a resolver fails.
+</ResponseField>
+
+<ResponseField
+  name="quote"
+  type={'(params: Omit<QuoteParams, "adapter">) => Promise<Quote>'}
+>
+  `engine.quote` with the connected EVM adapter filled in. Throws `ConfigError`
+  when no EVM wallet is connected, and anything `engine.quote` throws.
+</ResponseField>
+
+<ResponseField
+  name="send"
+  type={
+    '(params: Omit<SendParams, "adapter">, listeners?: SendListeners) => Promise<SendResult>'
+  }
+>
+  `engine.send` with the connected EVM adapter, run as a TanStack Query
+  mutation. Resolves to the `SendResult`; rejects with `ConfigError` when no
+  wallet is connected, and with anything `engine.send` throws
+  (`QuoteExpiredError`, `QuoteChangedError`, `InsufficientBalanceError`, ...).
+  Pass `destinationAdapter` and `metadata` in `params`.
+</ResponseField>
+
+<ResponseField name="isSending" type="boolean">
+  `true` while a `send` is running.
+</ResponseField>
+
+<ResponseField name="lastResult" type="SendResult | null">
+  The latest resolved result. Check `kind`: a `"failure"` here is a transfer
+  that started and stopped.
+</ResponseField>
+
+<ResponseField name="sendError" type="Error | null">
+  Set when `send` rejected.
+</ResponseField>
+
+<ResponseField name="reset" type="() => void">
+  Clears `lastResult` and `sendError`.
+</ResponseField>
+
+`UseWhiskResult` is the type of the returned object.
+
+## useReceipt
+
+```ts
+function useReceipt(input: UseReceiptInput): UseReceiptResult;
+```
+
+Polls Iris for one transfer and returns a [ReceiptView](/reference/core/types#receipts). A same-chain transfer never polls. A cross-chain one polls until Iris reports `complete`, `pollTimeoutMs` passes, or `destinationTxHash` or `hasError` is set. The timeout restarts only when `sourceChain` or `sourceTxHash` changes. Guide: [useReceipt](/hooks/use-receipt).
+
+```tsx Stage.tsx
+import { useReceipt, RECEIPT_STAGE_LABELS } from "@usewhisk/react";
+
+export function Stage({ txHash }: { txHash: string }) {
+  const { view, isLoading, error, irisStatus, message } = useReceipt({
+    sourceChain: "Base_Sepolia",
+    sourceTxHash: txHash,
+    destinationChain: "Arc_Testnet",
+  });
+  if (error) return <p>{error.message}</p>;
+  if (isLoading || !view) return <p>Checking…</p>;
+  return (
+    <p title={`${irisStatus ?? ""} ${message?.eventNonce ?? ""}`}>
+      {RECEIPT_STAGE_LABELS[view.stage]}
+    </p>
+  );
+}
+```
+
+<ParamField path="sourceChain" type="Chain" required>
+  Chain the transfer was sent from.
+</ParamField>
+
+<ParamField path="sourceTxHash" type="string | undefined" required>
+  The burn or transfer hash. While `undefined`, nothing polls and `view` is
+  `null`.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain" required>
+  Equal to `sourceChain` for a same-chain send.
+</ParamField>
+
+<ParamField path="destinationTxHash" type="string">
+  The mint hash, when known. The view becomes `settled` and polling stops.
+</ParamField>
+
+<ParamField path="hasError" type="boolean">
+  Forces the `failed` stage and stops polling.
+</ParamField>
+
+<ParamField path="pollIntervalMs" type="number">
+  Defaults to 3000.
+</ParamField>
+
+<ParamField path="pollTimeoutMs" type="number">
+  Defaults to 600000 (10 minutes).
+</ParamField>
+
+<ResponseField name="view" type="ReceiptView | null">
+  Stage, steps and explorer links. `null` without a `sourceTxHash`.
+</ResponseField>
+
+<ResponseField
+  name="irisStatus"
+  type={'"pending_confirmations" | "complete" | "not_found" | undefined'}
+>
+  The latest Iris status. `undefined` before the first response.
+</ResponseField>
+
+<ResponseField name="message" type="IrisMessage | null">
+  The latest Iris message, with `message`, `attestation` and `eventNonce` once
+  available.
+</ResponseField>
+
+<ResponseField name="isLoading" type="boolean">
+  `true` while waiting for the first poll.
+</ResponseField>
+
+<ResponseField name="error" type="Error | null">
+  Set when a poll failed, such as on a network error. Iris errors come from
+  `@usewhisk/cctp` and are not `WhiskError`s.
+</ResponseField>
+
+`UseReceiptInput` and `UseReceiptResult` are the types of the argument and the result.
+
+## useRefund
+
+```ts
+function useRefund(): UseRefundResult;
+```
+
+Sends a refund from the connected EVM wallet, which acts as the merchant: `engine.refund` with `merchantAdapter` set to it. It cannot pass a `destinationAdapter`, so refunds whose mint Circle does not forward (into Solana, Stellar or Starknet) need `engine.refund` directly. Guide: [useRefund](/hooks/use-refund).
+
+```tsx RefundButton.tsx
+import { useRefund } from "@usewhisk/react";
+
+export function RefundButton() {
+  const { refundAsync, isPending, error } = useRefund();
+
+  async function onClick() {
+    const result = await refundAsync({
+      originalTxHash: "0xabc123",
+      originalDestinationChain: "Arc_Testnet",
+      refundDestinationChain: "Base_Sepolia",
+      originalSenderAddress: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+      amount: "5",
+      reason: "Order cancelled",
+      metadata: { orderId: "A-1001" },
+    });
+    if (result.kind === "success") console.log(result.metadata);
+  }
+
+  return (
+    <>
+      <button disabled={isPending} onClick={() => void onClick()}>
+        Refund
+      </button>
+      {error ? <p>{error.message}</p> : null}
+    </>
+  );
+}
+```
+
+`UseRefundVariables` is `RefundInput & { listeners?: SendListeners }`. See [RefundInput](/reference/core/types#refunds) for the fields.
+
+<ResponseField name="refund" type="(input: UseRefundVariables) => void">
+  Starts a refund without returning a promise. The result lands on `data`, a
+  thrown error on `error`.
+</ResponseField>
+
+<ResponseField
+  name="refundAsync"
+  type="(input: UseRefundVariables) => Promise<RefundResult>"
+>
+  Resolves to the `RefundResult`. Rejects with `ConfigError` when no wallet is
+  connected or the input is invalid, and with anything `engine.refund` throws.
+</ResponseField>
+
+<ResponseField name="data" type="RefundResult | null">
+  The latest result. Its `metadata` carries `__refundOfTxHash` and, when given,
+  `__refundReason`.
+</ResponseField>
+
+<ResponseField name="error" type="Error | null">
+  Set when the refund rejected.
+</ResponseField>
+
+<ResponseField name="isPending" type="boolean">
+  `true` while a refund is running.
+</ResponseField>
+
+<ResponseField name="reset" type="() => void">
+  Clears `data` and `error`.
+</ResponseField>
+
+`UseRefundResult` is the type of the returned object.
+
+## useWhiskEngine
+
+```ts
+function useWhiskEngine(): WhiskEngine;
+```
+
+The engine `<WhiskProvider>` created. Stable for the life of the provider. Guide: [useWhiskEngine](/hooks/use-whisk-engine).
+
+## useWhiskContext
+
+```ts
+function useWhiskContext(): {
+  engine: WhiskEngine;
+  config: WhiskClientConfig;
+  theme: WhiskThemeInput | undefined;
+};
+```
+
+The provider's engine, the `config` prop and the `theme` prop. Throws `ConfigError` outside `<WhiskProvider>`.
+
+## Wallet adapter hooks
+
+Each returns the connected wallet of one ecosystem as a [WhiskAdapter](/reference/core/engine#adapters), or `null` when none is connected or its factory is missing from `config.wallets`. The adapters turn wallet and RPC failures into `WhiskError`s with `toWhiskError`. Guide: [Wallet adapters](/hooks/wallet-adapters).
+
+```tsx useSendQuote.ts
+import {
+  useAdapterFor,
+  useEvmAdapter,
+  useSolanaAdapter,
+  useStarknetAdapter,
+  useStellarAdapter,
+  useWhiskContext,
+  useWhiskEngine,
+  type Quote,
+} from "@usewhisk/react";
+
+export function useSendQuote() {
+  const engine = useWhiskEngine();
+  const { config, theme } = useWhiskContext();
+  const adapterFor = useAdapterFor();
+  const evm = useEvmAdapter();
+  const solana = useSolanaAdapter();
+  const stellar = useStellarAdapter();
+  const starknet = useStarknetAdapter();
+
+  async function send(quote: Quote) {
+    if (quote.route.kind !== "bridge") return;
+    const adapter = adapterFor(quote.route.sourceChain);
+    const destinationAdapter = adapterFor(quote.route.destinationChain);
+    if (!adapter) throw new Error("Connect a wallet on the source chain.");
+    return engine.send({
+      quote,
+      adapter,
+      ...(destinationAdapter && { destinationAdapter }),
+    });
+  }
+
+  return { send, config, theme, connected: [evm, solana, stellar, starknet] };
+}
+```
+
+### useAdapterFor
+
+```ts
+function useAdapterFor(): (chain: Chain) => WhiskAdapter | null;
+```
+
+Returns a function that picks the connected adapter for a chain's ecosystem. This is how `<ResumeList>` and `<WhiskReceipt>` find the wallet that signs a mint.
+
+### useEvmAdapter
+
+```ts
+function useEvmAdapter(): EvmAdapter | null;
+```
+
+The connected wagmi account as an `EvmAdapter`. Built with `createWagmiEvmAdapter`.
+
+### createWagmiEvmAdapter
+
+```ts
+function createWagmiEvmAdapter(
+  wagmiConfig: Config,
+  address: `0x${string}`,
+): EvmAdapter;
+```
+
+The adapter behind `useEvmAdapter`, for a wagmi `Config` you hold outside React.
+
+```ts
+import { createConfig, http } from "wagmi";
+import { baseSepolia } from "wagmi/chains";
+import { createWagmiEvmAdapter } from "@usewhisk/react";
+
+const wagmiConfig = createConfig({
+  chains: [baseSepolia],
+  transports: { [baseSepolia.id]: http() },
+});
+
+export const adapter = createWagmiEvmAdapter(
+  wagmiConfig,
+  "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+);
+```
+
+How it behaves:
+
+- `sendCalls` sends one transaction per call, in order, through wagmi's `sendTransaction`. It waits for each receipt before the next call (two confirmations between calls, one for the last), so a burn never races its approve.
+- `supportsAtomicBatch(chainId)` reads wagmi's `getCapabilities` for the account and chain, and says yes when the wallet reports atomic batching as `supported` or `ready`. A wallet without EIP-5792, whose call fails, counts as no.
+- `sendCalls(calls, { atomic: true })` sends one batch through wagmi's `sendCalls` with `forceAtomic`, waits with `waitForCallsStatus`, and reports the batch's last transaction hash as the one hash for every call. Calls that carry their own gas price, as every call on Arc does, and a wallet that refuses the batch with EIP-5792 error 5760, throw `WalletCapabilityError("atomic_unsupported")` before anything is sent, and the engine sends the calls one by one instead.
+- `maxFeePerGas` and `maxPriorityFeePerGas` are passed to the wallet when the engine sets them (it does on Arc).
+- A reverted transaction throws `OnchainRevertError`; a rejected prompt throws `UserRejectedError`.
+
+### useSolanaAdapter
+
+```ts
+function useSolanaAdapter(): SolanaAdapter | null;
+```
+
+The connected Wallet Standard wallet. `getCluster()` returns `"mainnet-beta"` when `solana({ network: "mainnet-beta" })` and `"devnet"` otherwise. `sendTransaction` builds a legacy transaction with a fresh blockhash, partial-signs with the engine's extra signers, then asks the wallet to sign and send. `confirmTransaction` waits at `confirmed` and reports `slot` as `0n`.
+
+### useStellarAdapter
+
+```ts
+function useStellarAdapter(): StellarAdapter | null;
+```
+
+The connected Stellar Wallets Kit wallet. Each invocation is simulated, signed and submitted on its own, and the next waits until the previous one succeeds, up to 60 seconds each. `getNetwork()` returns the factory's `network`. `getTrustline(account, asset)` reads the trustline ledger entry over the factory's Soroban RPC, returns `null` when there is none, and throws on an RPC failure, so a failed read never looks like a missing trustline.
+
+### useStarknetAdapter
+
+```ts
+function useStarknetAdapter(): StarknetAdapter | null;
+```
+
+The connected Starknet wallet. `submitCalls` sends all calls as one multicall through `wallet_addInvokeTransaction`, so approve and burn land atomically. `confirmTransaction` polls the factory's RPC every 3 seconds for up to 10 minutes.

@@ -1,0 +1,174 @@
+---
+title: Errors
+description: How Whisk reports failures, how to show them to payers, and how to tell a failure that moved no money from one that needs recovery.
+---
+
+Every error Whisk produces is a `WhiskError` with a `code`. `quote` and `send` throw when they refuse before anything is signed. Once a wallet is involved, `send` returns `{ kind: "failure", error, steps }` instead, and the steps tell you whether USDC has left the payer's wallet.
+
+```ts
+import {
+  QuoteChangedError,
+  QuoteExpiredError,
+  toWhiskError,
+  type EvmAdapter,
+  type Quote,
+  type WhiskEngine,
+} from "@usewhisk/core";
+
+declare const engine: WhiskEngine;
+declare const quote: Quote;
+declare const adapter: EvmAdapter;
+declare function show(message: string): void;
+
+try {
+  const result = await engine.send({ quote, adapter });
+  if (result.kind === "failure") {
+    const burn = result.steps.find((s) => s.name === "burn");
+    show(
+      burn?.txHash
+        ? `${result.error.message} Your USDC is safe in transit. Resume the transfer to finish it.`
+        : result.error.message,
+    );
+  }
+} catch (err) {
+  if (err instanceof QuoteChangedError || err instanceof QuoteExpiredError) {
+    show(err.message);
+  } else {
+    show(toWhiskError(err, "The transfer could not be sent.").message);
+  }
+}
+```
+
+## WhiskError
+
+<ResponseField name="code" type="WhiskErrorCode">
+  What went wrong, such as `"INSUFFICIENT_BALANCE"` or `"USER_REJECTED"`. Branch
+  on this or on the subclass.
+</ResponseField>
+<ResponseField name="message" type="string">
+  A short message written for the payer. Wallet and RPC errors are cut down to
+  their first line.
+</ResponseField>
+<ResponseField name="retryable" type="boolean">
+  Whether trying the same thing again can succeed, such as after a network
+  error, a wallet rejection or a slow attestation.
+</ResponseField>
+<ResponseField name="step" type="StepName">
+  The step that failed, where one applies.
+</ResponseField>
+<ResponseField name="category" type="WhiskErrorCategory">
+  A finer classification of wallet and chain failures.
+</ResponseField>
+<ResponseField name="cause" type="unknown">
+  The original error, with the full wallet or RPC text. Log it; do not show it.
+</ResponseField>
+
+Each code has its own subclass (`InsufficientBalanceError`, `RouteUnavailableError`, `QuoteChangedError`, and so on), some with extra fields. [Errors reference](/reference/core/errors) lists every class, code and field.
+
+## Categories
+
+`WhiskErrorCategory` uses the same values as Circle App Kit's step error categories:
+
+| Category                                                                        | Meaning                                                                  |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `user_rejected`                                                                 | The payer declined in the wallet.                                        |
+| `atomic_unsupported`, `batch_too_large`, `duplicate_batch_id`, `unknown_bundle` | The wallet could not handle a batch of calls (`WalletCapabilityError`).  |
+| `polling_timeout`                                                               | Whisk stopped waiting for a receipt, an attestation or a forwarded mint. |
+| `failed_offchain`                                                               | A request failed before reaching the chain (`NetworkError`).             |
+| `reverted_onchain`, `partial_reverted`, `chain_revert`                          | A transaction was mined and reverted (`OnchainRevertError`).             |
+| `unknown`                                                                       | Nothing more specific is known.                                          |
+
+A failed step carries the same category on `step.errorCategory`.
+
+`polling_timeout` on a `fetchAttestation` or `mint` step means Whisk stopped waiting, not that the transfer failed. In 0.3 such a failure arrives as a `WalletCapabilityError` (code `WALLET_CAPABILITY`) with `retryable: false`, even though the transfer can be finished with `resume`. Check the step and the category rather than `retryable` here; see [recovery](/concepts/recovery).
+
+## toWhiskError and cleanErrorMessage
+
+`toWhiskError(err, fallbackMessage?, category?)` turns any thrown value into a `WhiskError`:
+
+- a `WhiskError` comes back unchanged;
+- with a `category`, the category picks the subclass;
+- otherwise the message is matched: "user rejected" and "user denied" become `UserRejectedError` with the message "You cancelled the transaction in your wallet."; connection failures (`ECONNRESET`, `fetch failed`, 5xx status codes and similar) become `NetworkError`;
+- anything else becomes a `WhiskError` with code `UNKNOWN`.
+
+The original value is always kept on `cause`.
+
+```ts
+import { cleanErrorMessage, toWhiskError } from "@usewhisk/core";
+
+const raw = new Error(
+  "User rejected the request.\n\nRequest Arguments:\n  from: 0x742d...\n\nVersion: viem@2",
+);
+
+const error = toWhiskError(raw);
+console.log(error.code, error.message, error.cause === raw);
+// "USER_REJECTED" "You cancelled the transaction in your wallet." true
+
+cleanErrorMessage("Execution reverted.\nDetails: out of gas\nVersion: viem@2");
+// "Execution reverted."
+```
+
+`cleanErrorMessage(message)` keeps the first line of a viem or wallet error, drops an inline "Request Arguments:" dump and App Kit's "Unknown blockchain error on ...:" prefix. Use it on errors from your own wallet code before showing them.
+
+## Before the burn, and after
+
+What a failure means for the payer depends on whether the burn was submitted.
+
+**Thrown by `quote` or `send`.** Nothing was signed and no USDC moved. The payer can fix the input and try again. These include:
+
+| Error                                    | Typical cause                                                                                                                                                               |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InvalidAddressError`                    | The recipient is not a valid address for the destination ecosystem, or a Starknet recipient looks like an Ethereum address.                                                 |
+| `NetworkMismatchError`                   | One chain is mainnet and the other testnet.                                                                                                                                 |
+| `RouteUnavailableError`                  | A required wallet is not connected (`source_adapter_required`, `destination_adapter_required`), or a Starknet recipient has no account deployed (`recipient_not_deployed`). |
+| `InsufficientBalanceError`               | An EVM payer's USDC cannot cover `amountIn` (plus gas on Arc). Has `required` and `available`.                                                                              |
+| `QuoteExpiredError`, `QuoteChangedError` | The quote lapsed, or fees rose past it. See [bound quotes](/concepts/quotes-and-fees#bound-quotes).                                                                         |
+| `ConfigError`                            | A setup problem, such as an adapter of the wrong ecosystem or an invalid fee recipient.                                                                                     |
+
+**Returned as a failure, no burn hash.** The burn was not submitted: the payer rejected it, the source or destination wallet was on the wrong network, a Solana recipient has no USDC account, a Stellar recipient has no usable USDC trustline, or a transaction before the burn reverted. The payer's USDC is where it was, and no merchant fee was taken, since the fee only goes with the burn or after it. Approvals cost gas but move no USDC.
+
+**Returned as a failure, with a burn hash.** The burn was submitted. The failure is on the `burn` step (waiting for its receipt), `fetchAttestation` or `mint`. The USDC has left the payer's wallet and is not lost: the transfer is in the in-flight store, and `resume` or `resumeFromTx` finishes it. Do not offer "try again" here, since a new `send` burns again. Offer "resume", and keep the burn hash visible.
+
+Check `result.steps.find((s) => s.name === "burn")?.txHash`, or record the hash from `onBurnSubmitted`, which fires as soon as the wallet returns it. On a wallet that submits calls one by one, a failure while waiting for an earlier call's receipt can leave the burn step without a hash even though the burn went out; the in-flight record still has it. When in doubt, check `engine.inflight()` before letting the payer start over.
+
+A burn that reverted on chain (`OnchainRevertError` on the `burn` step) moved no USDC, even though it has a hash.
+
+## Showing errors to payers
+
+- Show `error.message`. It is written to be read by a payer, and wallet errors are already cleaned.
+- Treat `USER_REJECTED` as a cancel, not an error: return the form to its previous state.
+- `INSUFFICIENT_BALANCE`, `WRONG_CHAIN`, `NETWORK_MISMATCH`, `ROUTE_UNAVAILABLE` and `INVALID_ADDRESS` each point at something the payer can change. Put the message next to the field it concerns.
+- When `retryable` is true, offer a retry. When the burn already went out, offer resume instead.
+- Log `cause` and `code` for support; never show `cause` to the payer.
+
+```ts
+import { WhiskError } from "@usewhisk/core";
+
+function describe(error: WhiskError): string | null {
+  switch (error.code) {
+    case "USER_REJECTED":
+      return null;
+    case "INSUFFICIENT_BALANCE":
+    case "WRONG_CHAIN":
+    case "NETWORK_MISMATCH":
+    case "ROUTE_UNAVAILABLE":
+    case "INVALID_ADDRESS":
+      return error.message;
+    default:
+      return error.retryable ? `${error.message} Try again.` : error.message;
+  }
+}
+```
+
+`<WhiskSend>` shows each error in a banner and re-confirms changed quotes. Its `<ResumeList>` reads the in-flight store when it mounts, so a transfer that failed after the burn appears there with a Resume button after the widget remounts, such as on reload. In 0.3 the failure banner itself does not offer resume, so a payer whose burn went out sees "Failed." until then. If that matters for your flow, handle `onFailure` and point the payer at recovery yourself.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Errors reference" href="/reference/core/errors">
+    Every error class, code and field.
+  </Card>
+  <Card title="Recovery" href="/concepts/recovery">
+    Finishing a transfer that failed after the burn.
+  </Card>
+</CardGroup>

@@ -1,0 +1,327 @@
+---
+title: useWhisk
+description: The engine, the connected EVM wallet, and quote and send actions for a send UI you build yourself.
+---
+
+`useWhisk` gives a custom component what `<WhiskSend>` uses: the engine, the
+connected EVM wallet, and `resolve`, `quote` and `send` bound to that wallet.
+
+```tsx WalletBadge.tsx
+import { useWhisk } from "@usewhisk/react";
+
+export function WalletBadge() {
+  const { isConnected, address, isSending } = useWhisk();
+
+  if (!isConnected) return <p>Connect a wallet to send USDC.</p>;
+  return (
+    <p>
+      {address} {isSending ? "(sending)" : null}
+    </p>
+  );
+}
+```
+
+Call it anywhere under [`<WhiskProvider>`](/widget/whisk-provider). It reads the
+EVM account from wagmi, so the provider needs `evm()` in `config.wallets` or an
+outer `WagmiProvider` of your own. The hook covers EVM wallets only. For a
+Solana, Stellar or Starknet source, get the adapter from
+[`useAdapterFor`](/hooks/wallet-adapters) and call the engine directly.
+
+## Quote, then send
+
+`quote` and `send` take the same parameters as `engine.quote` and `engine.send`,
+minus `adapter`: the hook fills in the connected wallet. Amounts are decimal
+USDC strings such as `"1.50"`.
+
+```ts usePay.ts
+import { useWhisk } from "@usewhisk/react";
+
+export function usePay() {
+  const { resolve, quote, send } = useWhisk();
+
+  return async function pay(to: string, amount: string) {
+    const recipient = await resolve(to, "Arc_Testnet");
+    const q = await quote({
+      sourceChain: "Base_Sepolia",
+      destinationChain: "Arc_Testnet",
+      recipient,
+      amount,
+    });
+    // Show q.amountIn and q.amountOut to the payer before this line.
+    return send(
+      { quote: q, metadata: { orderId: "ord_123" } },
+      {
+        onStep: (step) => console.log(step.name, step.state),
+        onBurnSubmitted: (txHash) => console.log("burned in", txHash),
+      },
+    );
+  };
+}
+```
+
+`send` signs exactly what the quote says. It takes the chains, the recipient and
+the amounts from `quote`, so there is nothing else to pass except optional
+`metadata` (see [metadata](/flows/metadata)). A quote is good for 60 seconds
+from `issuedAt`; check `quote.expiresAt` and fetch a fresh one before the payer
+confirms a stale one.
+
+`send` ends in one of two ways:
+
+- It **throws** when it refuses before anything is signed: no wallet connected
+  (`ConfigError`), the quote expired (`QuoteExpiredError`), fees rose past what
+  the payer confirmed (`QuoteChangedError`, which carries the fresh quote on
+  `error.quote`), or the balance cannot cover the debit
+  (`InsufficientBalanceError`). No USDC has moved.
+- It **resolves** to a `SendResult` once the wallet is involved. Branch on
+  `result.kind`. A `"failure"` after the burn means USDC left the payer's
+  wallet and has not been minted yet. The transfer is kept in the in-flight
+  store and can be finished; see [recovery](/concepts/recovery).
+
+## Returns
+
+<ResponseField name="engine" type="WhiskEngine">
+  The engine built by `<WhiskProvider>`. Same object as
+  [`useWhiskEngine()`](/hooks/use-whisk-engine).
+</ResponseField>
+
+<ResponseField name="adapter" type="EvmAdapter | null">
+  The connected wagmi account as an `EvmAdapter`. `null` until an EVM wallet
+  connects.
+</ResponseField>
+
+<ResponseField name="address" type="0x${string} | undefined">
+  The connected EVM address.
+</ResponseField>
+
+<ResponseField name="isConnected" type="boolean">
+  `true` when an EVM wallet is connected.
+</ResponseField>
+
+<ResponseField
+  name="resolve"
+  type="(input: string, chain: Chain) => Promise<ResolvedRecipient>"
+>
+  Turns an address or a name into a `ResolvedRecipient` for `chain`, using the
+  provider's resolver (addresses and ENS by default). Throws `ConfigError` when
+  nothing matches.
+</ResponseField>
+
+<ResponseField
+  name="quote"
+  type="(params: Omit<QuoteParams, 'adapter'>) => Promise<Quote>"
+>
+  Builds a quote for the connected wallet. Throws `ConfigError` with no wallet
+  connected. Pass `destinationAdapter` for routes where Circle does not forward
+  the mint.
+</ResponseField>
+
+<ResponseField
+  name="send"
+  type="(params: Omit<SendParams, 'adapter'>, listeners?: SendListeners) => Promise<SendResult>"
+>
+  Sends a confirmed quote. `listeners.onStep` fires on every step change and
+  `listeners.onBurnSubmitted` fires with the burn hash as soon as the wallet
+  returns it.
+</ResponseField>
+
+<ResponseField name="isSending" type="boolean">
+  `true` while a `send` is in flight.
+</ResponseField>
+
+<ResponseField name="lastResult" type="SendResult | null">
+  The result of the latest `send`, success or failure.
+</ResponseField>
+
+<ResponseField name="sendError" type="Error | null">
+  Set when the latest `send` threw. The promise returned by `send` also rejects
+  with it.
+</ResponseField>
+
+<ResponseField name="reset" type="() => void">
+  Clears `lastResult` and `sendError`. It does not cancel a send in flight.
+</ResponseField>
+
+`isSending`, `lastResult` and `sendError` track `send` only. `quote` and
+`resolve` keep no state, so track their loading and errors yourself.
+
+## The state machine
+
+`useWhisk` does not hold a flow state. `@usewhisk/core` ships the one Whisk uses
+as a plain reducer, so a custom UI can reuse it with `useReducer`:
+`WhiskState` is the state, `WhiskStateKind` is the union of its `kind` values,
+and `reduce(state, action)` moves between them.
+
+| `kind`         | Carries                                                 | Reached by                                         |
+| -------------- | ------------------------------------------------------- | -------------------------------------------------- |
+| `disconnected` | nothing                                                 | `initialState`, `DISCONNECTED`                     |
+| `idle`         | nothing                                                 | `CONNECTED`, `RESET`                               |
+| `resolving`    | `input`                                                 | `RESOLVE_START` from `idle` or `resolved`          |
+| `resolved`     | `recipient`                                             | `RESOLVE_SUCCESS`, `REVIEW_BACK`                   |
+| `quoting`      | `recipient`, `amount`                                   | `QUOTE_START` from `resolved` or `review`          |
+| `review`       | `quote`                                                 | `QUOTE_SUCCESS`                                    |
+| `sending`      | `quote`, `steps`, `currentStep`                         | `SEND_START` from `review`, `RETRY_START`          |
+| `succeeded`    | `quote`, `steps`, `finalTxHash?`                        | `SEND_SUCCESS`                                     |
+| `failed`       | `error`, and `quote`, `steps`, `raw` when a send failed | `RESOLVE_FAILURE`, `QUOTE_FAILURE`, `SEND_FAILURE` |
+
+An action that does not fit the current state returns the state unchanged
+instead of throwing. `SEND_START` fills `steps` with every step of the route
+as `pending` (`approve`, `transfer` for a same-chain send; `approve`, `burn`,
+`fetchAttestation`, `mint` for a bridge), and each `STEP_UPDATE` merges one
+step in. `RESET` goes back to `idle` from anywhere except `disconnected`.
+
+`reduce`, `initialState` and `initialSteps` are exported from `@usewhisk/core`
+only. `@usewhisk/react` depends on it, but add it to your own `package.json`
+before importing from it. The `WhiskState` and `WhiskStateKind` types are
+exported from both packages.
+
+## Build a custom send UI
+
+This component quotes a Base Sepolia to Arc Testnet bridge, shows the review,
+sends, and shows each step, all on Whisk's reducer. It starts in `idle` because
+it renders a connect prompt itself while no wallet is connected.
+
+```tsx CustomSend.tsx
+"use client";
+
+import { useReducer, useState, type FormEvent } from "react";
+import {
+  toWhiskError,
+  useWhisk,
+  type Chain,
+  type ResolvedRecipient,
+} from "@usewhisk/react";
+import { reduce } from "@usewhisk/core";
+
+const SOURCE: Chain = "Base_Sepolia";
+const DESTINATION: Chain = "Arc_Testnet";
+
+export function CustomSend() {
+  const { isConnected, resolve, quote, send } = useWhisk();
+  const [state, dispatch] = useReducer(reduce, { kind: "idle" });
+  const [to, setTo] = useState("");
+  const [amount, setAmount] = useState("");
+
+  async function getQuote(event: FormEvent) {
+    event.preventDefault();
+    dispatch({ type: "RESET" });
+    dispatch({ type: "RESOLVE_START", input: to });
+    let recipient: ResolvedRecipient;
+    try {
+      recipient = await resolve(to, DESTINATION);
+    } catch (err) {
+      dispatch({ type: "RESOLVE_FAILURE", error: toWhiskError(err) });
+      return;
+    }
+    dispatch({ type: "RESOLVE_SUCCESS", recipient });
+    dispatch({ type: "QUOTE_START", recipient, amount });
+    try {
+      const q = await quote({
+        sourceChain: SOURCE,
+        destinationChain: DESTINATION,
+        recipient,
+        amount,
+      });
+      dispatch({ type: "QUOTE_SUCCESS", quote: q });
+    } catch (err) {
+      dispatch({ type: "QUOTE_FAILURE", error: toWhiskError(err) });
+    }
+  }
+
+  async function confirm() {
+    if (state.kind !== "review") return;
+    dispatch({ type: "SEND_START" });
+    try {
+      const result = await send(
+        { quote: state.quote },
+        { onStep: (step) => dispatch({ type: "STEP_UPDATE", step }) },
+      );
+      if (result.kind === "success") {
+        dispatch({ type: "SEND_SUCCESS", finalTxHash: result.finalTxHash });
+      } else {
+        dispatch({
+          type: "SEND_FAILURE",
+          error: result.error,
+          raw: result.raw,
+        });
+      }
+    } catch (err) {
+      dispatch({ type: "SEND_FAILURE", error: toWhiskError(err) });
+    }
+  }
+
+  if (!isConnected) return <p>Connect a wallet to continue.</p>;
+
+  switch (state.kind) {
+    case "resolving":
+    case "quoting":
+      return <p>Getting a quote...</p>;
+
+    case "review":
+      return (
+        <div>
+          <p>You pay {state.quote.amountIn} USDC</p>
+          <p>Recipient gets at least {state.quote.amountOut} USDC</p>
+          <p>Fees: {state.quote.fees.total} USDC</p>
+          <button onClick={() => dispatch({ type: "REVIEW_BACK" })}>
+            Back
+          </button>
+          <button onClick={confirm}>Confirm</button>
+        </div>
+      );
+
+    case "sending":
+      return (
+        <ol>
+          {state.steps.map((step) => (
+            <li key={step.name}>
+              {step.name}: {step.state}
+            </li>
+          ))}
+        </ol>
+      );
+
+    case "succeeded":
+      return <p>Delivered. Mint tx: {state.finalTxHash ?? "not reported"}</p>;
+
+    default:
+      return (
+        <form onSubmit={getQuote}>
+          {state.kind === "failed" ? (
+            <p role="alert">{state.error.message}</p>
+          ) : null}
+          <input
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            placeholder="0x... or name.eth"
+          />
+          <input
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            inputMode="decimal"
+            placeholder="0.00"
+          />
+          <button type="submit">Get quote</button>
+        </form>
+      );
+  }
+}
+```
+
+A few things this leaves to you:
+
+- **Connecting.** Render [`<ConnectModal>`](/widget/connect-modal) or your own
+  wagmi connect buttons where the prompt is.
+- **Quote expiry.** If the payer waits more than 60 seconds on the review
+  screen, `send` throws `QuoteExpiredError` and the form shows its message.
+  Re-quote on a timer instead if you want the review to stay live.
+- **Changed fees.** `QuoteChangedError` lands in `failed` the same way. Its
+  `error.quote` is the fresh quote if you would rather show it straight away.
+- **Retry.** `RETRY_START` exists for the widget's own retry. To finish a
+  bridge that failed after the burn, use `engine.resume`; see
+  [recovery](/concepts/recovery).
+
+## Related
+
+- [`useAdapterFor`](/hooks/wallet-adapters) for non-EVM wallets.
+- [`useReceipt`](/hooks/use-receipt) to follow a transfer after the burn.
+- [Errors](/concepts/errors) for every `error.code`.

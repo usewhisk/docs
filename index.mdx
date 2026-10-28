@@ -1,0 +1,80 @@
+---
+title: "Whisk"
+description: "Send and bridge USDC over Circle CCTP V2 across EVM chains, Solana, Stellar and Starknet, with a React widget or a framework-agnostic engine."
+---
+
+Whisk moves USDC between wallets: on one chain, or across chains through Circle's Cross-Chain Transfer Protocol V2 (CCTP V2). It covers EVM chains, Solana, Stellar and Starknet, and every pair of those ecosystems can bridge in both directions. You can embed it as a React widget, or drive the same engine from your own UI or a server.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+
+const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base_Sepolia", "Arc_Testnet"] })],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+
+export default function App() {
+  return (
+    <WhiskProvider config={config}>
+      <WhiskSend onSuccess={(result) => console.log(result.finalTxHash)} />
+    </WhiskProvider>
+  );
+}
+```
+
+That renders a widget with a Send tab (USDC on one chain) and a Bridge tab (USDC across chains). It connects the payer's wallet, resolves the recipient, shows the fees before the payer confirms, and follows the transfer through approve, burn, attestation and mint.
+
+## What happens to the money
+
+A bridge burns USDC on the source chain and mints the same USDC on the destination. Circle's attestation service (Iris) signs the burn, and the mint is submitted either by Circle's Forwarding Service or by a wallet the payer connects on the destination. Whisk calls Circle's CCTP V2 contracts and Iris directly. There is no Whisk server in the path, and no private key ever reaches Whisk: every transaction is signed in the payer's wallet.
+
+Before anything is signed, the payer sees a quote with every fee in it. `send` signs exactly that quote, and refuses it if it expired or fees rose. Every bridge is saved from the moment the burn is signed, so if the tab closes between the burn and the mint, the widget lists the transfer after a reload and finishes the mint without a second burn. See [how it works](/concepts/how-it-works).
+
+Mainnet or testnet always follows the source chain. There is no `mode` option, and a route that mixes the two is refused before anything is signed.
+
+## Packages
+
+| Package           | Use it when                                                                                                                                                    |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@usewhisk/react` | You have a React app. Ships `WhiskProvider`, the `WhiskSend` widget, receipts and resume UI, the wallet factories, and hooks such as `useWhisk`.               |
+| `@usewhisk/core`  | You want the engine without React: a Vue or Svelte UI, a Node script, a server route. Exports `createWhisk`, the adapter interfaces, errors, fees and amounts. |
+| `@usewhisk/cctp`  | You want the protocol layer on its own: the chain registry, CCTP V2 contract addresses and ABIs, burn and mint builders, fee maths and the Iris client.        |
+
+`@usewhisk/react` depends on `@usewhisk/core`, which depends on `@usewhisk/cctp`, so installing the widget brings the other two with it. These docs cover `@usewhisk/react` and `@usewhisk/core` 0.3.x, and `@usewhisk/cctp` 0.1.x.
+
+Using the engine without React looks like this:
+
+```ts server.ts
+import { createWhisk } from "@usewhisk/core";
+import { getChain } from "@usewhisk/cctp";
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+const arc = getChain("Arc_Testnet");
+console.log(engine, arc.cctpDomain, arc.capabilities.fastSource);
+```
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" href="/quickstart">
+    A working send widget in a React app, on testnet.
+  </Card>
+  <Card title="How it works" href="/concepts/how-it-works">
+    Routes, burns, attestations, mints and what Whisk does at each step.
+  </Card>
+  <Card title="WhiskSend" href="/widget/whisk-send">
+    Every prop of the widget: locked fields, defaults, tabs and callbacks.
+  </Card>
+  <Card title="Core engine" href="/headless/core-engine">
+    Quote, send and resume transfers with `@usewhisk/core`, without React.
+  </Card>
+  <Card title="CCTP reference" href="/reference/cctp/overview">
+    The protocol layer: chains, builders, Iris and fees.
+  </Card>
+</CardGroup>

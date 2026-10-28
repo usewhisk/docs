@@ -1,0 +1,200 @@
+---
+title: Themed SaaS dashboard
+sidebarTitle: Themed SaaS
+description: A dark treasury dashboard that restyles WhiskSend with CSS variables so it matches the host product.
+---
+
+The `themed-saas` example is a Next.js 15 dashboard for a fictional company,
+Steelpath Cloud, with a sidebar, KPI tiles, a vendor table and an activity log.
+Clicking a vendor loads a `<WhiskSend>` with that vendor's amount. The point of
+the example is the look: the widget takes the dashboard's dark navy and teal
+palette through Whisk's `--whisk-*` CSS variables.
+
+```css globals.css
+[data-whisk] {
+  --whisk-bg: #0c1827;
+  --whisk-card: #15263a;
+  --whisk-card-fg: #e8eef7;
+  --whisk-fg: #e8eef7;
+  --whisk-fg-muted: #6b7a8d;
+  --whisk-border: rgba(255, 255, 255, 0.16);
+  --whisk-input: rgba(255, 255, 255, 0.16);
+  --whisk-border-w: 1px;
+  --whisk-primary: #5dd9c5;
+  --whisk-primary-fg: #050810;
+  --whisk-ring: #5dd9c5;
+  --whisk-success: #4ade80;
+  --whisk-warning: #f5a142;
+  --whisk-destructive: #f87171;
+  --whisk-destructive-fg: #050810;
+  --whisk-radius: 10px;
+  --whisk-radius-sm: 6px;
+  --whisk-radius-md: 10px;
+  --whisk-radius-lg: 14px;
+}
+```
+
+The example writes these as `var(--color-*)` references to its Tailwind v4
+`@theme` tokens; the values above are what they resolve to. It also maps
+`--whisk-font`, `--whisk-font-display` and `--whisk-font-mono` to its own
+fonts.
+
+## How it works
+
+- **The variables sit on `[data-whisk]`.** `<WhiskProvider>` puts that
+  attribute on the element that wraps its children, and the portal its dialogs
+  render into sits inside it, so one rule reaches both.
+- **Load order decides ties.** `src/app/layout.tsx` imports
+  `@usewhisk/react/styles.css` first and `./globals.css` second. Both target
+  `[data-whisk]` with the same specificity, so the later file wins.
+- **Dark preset underneath.** The provider passes `theme="dark"`, so anything
+  the CSS does not override (and the `data-whisk-theme` attribute) comes from
+  the dark preset.
+- **One widget, many vendors.** `src/hooks/use-payout.ts` holds which vendor is
+  selected and switches to a confirmed state with the tx hash from `onSuccess`.
+
+The provider and the payout widget, trimmed:
+
+<CodeGroup>
+
+```tsx providers.tsx
+"use client";
+
+import { useMemo, type ReactNode } from "react";
+import { WhiskProvider, createWhiskConfig, evm } from "@usewhisk/react";
+
+export function Providers({ children }: { children: ReactNode }) {
+  const config = useMemo(
+    () =>
+      createWhiskConfig({
+        feeBearer: "sender",
+        wallets: [
+          evm({
+            chains: ["Arc_Testnet", "Base_Sepolia"],
+            projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+            appName: "Steelpath Cloud",
+          }),
+        ],
+        chains: ["Arc_Testnet", "Base_Sepolia"],
+        defaultSourceChain: "Arc_Testnet",
+        defaultDestinationChain: "Arc_Testnet",
+        appLabel: "whisk-example-themed-saas",
+      }),
+    [],
+  );
+
+  return (
+    <WhiskProvider config={config} theme="dark">
+      {children}
+    </WhiskProvider>
+  );
+}
+```
+
+```tsx quick-send.tsx
+"use client";
+
+import { WhiskSend } from "@usewhisk/react";
+
+export type Vendor = { id: string; name: string; amount: string };
+
+const TREASURY = "0x5B8ecaB7096F8aBED873D246629ef9f05f467605";
+
+export function QuickSend({
+  vendor,
+  onPaid,
+}: {
+  vendor: Vendor;
+  onPaid: (txHash?: string) => void;
+}) {
+  return (
+    <div className="sp-widget">
+      <WhiskSend
+        amount={vendor.amount}
+        recipient={TREASURY}
+        onSuccess={({ finalTxHash }) => onPaid(finalTxHash)}
+      />
+    </div>
+  );
+}
+```
+
+</CodeGroup>
+
+## The same theme without CSS
+
+The token overrides can also go on the provider, which writes the same
+variables as an inline style on the `[data-whisk]` element:
+
+```tsx providers.tsx
+import type { ReactNode } from "react";
+import { WhiskProvider, type WhiskClientConfig } from "@usewhisk/react";
+
+declare const config: WhiskClientConfig;
+
+export function Providers({ children }: { children: ReactNode }) {
+  return (
+    <WhiskProvider
+      config={config}
+      theme={{
+        preset: "dark",
+        tokens: {
+          bg: "#0c1827",
+          card: "#15263a",
+          fg: "#e8eef7",
+          fgMuted: "#6b7a8d",
+          primary: "#5dd9c5",
+          primaryFg: "#050810",
+          ring: "#5dd9c5",
+          radius: "10px",
+        },
+      }}
+    >
+      {children}
+    </WhiskProvider>
+  );
+}
+```
+
+Inline styles beat any stylesheet rule on `[data-whisk]`, so pick one
+approach. CSS is the better fit when the colours already live in your design
+tokens, as they do here. See [theming](/theming/overview) and the
+[token list](/theming/tokens).
+
+## Run it locally
+
+From a clone of [usewhisk/whisk](https://github.com/usewhisk/whisk), with Node
+20 or later and pnpm:
+
+```bash
+pnpm install
+pnpm build
+cp examples/themed-saas/.env.example examples/themed-saas/.env.local
+pnpm --filter @usewhisk/example-themed-saas dev
+```
+
+Open http://localhost:3012 and click a row in "Scheduled vendors". The `dev`
+script sets the port; the README's 3020 is out of date.
+
+| Variable                               | Required | Effect                                                                                         |
+| -------------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` | No       | Adds the WalletConnect connector. Without it, injected wallets and Coinbase Wallet still work. |
+
+## For production
+
+- **Pay the vendor, not the placeholder.** The example sends every payout to
+  one `TREASURY` address and ignores each vendor's handle and chain. Pass the
+  vendor's address (or an ENS name; the default resolver tries addresses, then
+  ENS) as `recipient`, and lock `destinationChain` to the vendor's chain with
+  `tabs={["bridge"]}`, or `sourceChain` and `destinationChain` to the same
+  chain with `tabs={["send"]}`.
+- **Fix the explorer link.** The confirmed state links to Arc Testnet's
+  explorer whatever chain paid. Use `explorerTxUrl(chain, hash)`.
+- **Record payouts on your server** with the tx hash, and verify them on chain
+  before marking an invoice settled, as in
+  [checkout](/flows/checkout#verify-on-your-server). The KPI tiles and
+  settlement feed are static data.
+- **Use mainnet chain ids** (`Arc`, `Base`) in the config.
+- **Check contrast.** If you change the palette, keep `--whisk-primary-fg`
+  readable on `--whisk-primary`, and `--whisk-fg-muted` readable on
+  `--whisk-card`.

@@ -1,0 +1,370 @@
+---
+title: Iris client
+description: Read attestations and forwarder state from Circle's Iris API, poll within its rate limit, reattest, and fetch quotes and the Fast allowance.
+---
+
+Iris is Circle's attestation service. After a burn lands, Iris publishes the message, Circle's signature over it, and, for forwarded burns, the state of Circle's relayer. This client reads it with timeouts, retries and a shared rate limiter.
+
+```ts
+import { BaseSepolia, getMessages } from "@usewhisk/cctp";
+
+const [msg] = await getMessages(
+  { sourceDomain: BaseSepolia.cctpDomain, transactionHash: "0x9c1e...burn" },
+  { network: "testnet" },
+);
+console.log(msg?.status, msg?.forwardState, msg?.forwardTxHash);
+```
+
+The client is also published on its own as `@usewhisk/cctp/iris`. No API key is needed.
+
+## Hosts
+
+| Export                 | Value                                                         |
+| ---------------------- | ------------------------------------------------------------- |
+| `IRIS_MAINNET_URL`     | `https://iris-api.circle.com`                                 |
+| `IRIS_SANDBOX_URL`     | `https://iris-api-sandbox.circle.com`                         |
+| `irisBaseUrl(network)` | The mainnet URL for `"mainnet"`, the sandbox for `"testnet"`. |
+
+Every function takes the `network` of the source chain. A testnet burn asked on the mainnet host returns nothing, because mainnet and testnet share domain numbers.
+
+## `getMessages`
+
+`getMessages(query: GetMessagesQuery, options: GetMessagesOptions): Promise<IrisMessage[]>`
+
+One request to `GET /v2/messages/{sourceDomain}`. Returns an empty array while Iris does not know the burn yet, whether it answers with no messages or a 404.
+
+<ParamField path="query.sourceDomain" type="number" required>
+  The domain of the chain the burn happened on.
+</ParamField>
+<ParamField path="query.transactionHash" type="string">
+  The burn transaction hash (a signature on Solana). Pass this or `nonce`.
+</ParamField>
+<ParamField path="query.nonce" type="string">
+  The message nonce. Use it after a [reattest](#reattest).
+</ParamField>
+<ParamField path="options.network" type='"mainnet" | "testnet"' required>
+  Picks the Iris host.
+</ParamField>
+<ParamField path="options.baseUrl" type="string">
+  Use another host, such as your own proxy in front of Iris. Defaults to
+  `irisBaseUrl(network)`. A trailing slash is ignored.
+</ParamField>
+
+`GetMessagesOptions` also takes every [request option](#request-options).
+
+### `IrisMessage`
+
+<ResponseField name="message" type="`0x${string}`">
+  The raw CCTP message. Pass it to a mint builder, or read it with
+  [`decodeBurnMessage`](/reference/cctp/builders#decoding-a-message).
+</ResponseField>
+<ResponseField name="attestation" type="`0x${string}`">
+  Circle's signature over the message. Only usable once `status` is
+  `"complete"`.
+</ResponseField>
+<ResponseField name="status" type='"pending_confirmations" | "complete"'>
+  `IrisAttestationStatus`. Iris never reports a failed attestation; a slow one
+  stays pending.
+</ResponseField>
+<ResponseField name="eventNonce" type="string">
+  The nonce as a decimal string.
+</ResponseField>
+<ResponseField name="cctpVersion" type="2">
+  Always `2`.
+</ResponseField>
+<ResponseField
+  name="forwardState"
+  type='"PENDING" | "CONFIRMED" | "COMPLETE" | "FAILED" | null'
+>
+  `ForwardState`, present only when the burn carried the forwarder hook.
+  `PENDING`: Circle's relayer is working. `CONFIRMED`: it submitted the mint and
+  is waiting for finality. `COMPLETE`: the mint is final. `FAILED`: the relayer
+  gave up, and the USDC is waiting for someone to mint it with the attestation.
+</ResponseField>
+<ResponseField name="forwardTxHash" type="string | null">
+  The destination mint transaction, once the relayer submitted it.
+</ResponseField>
+<ResponseField
+  name="delayReason"
+  type='"insufficient_fee" | "amount_above_max" | "insufficient_allowance_available" | null'
+>
+  `IrisDelayReason`: why the message is slower than asked, for example a Fast
+  burn whose `maxFee` did not cover the Fast fee. None of these is a failure.
+</ResponseField>
+<ResponseField name="decodedMessage" type="object">
+  Optional. Iris's own decoding of the message and burn body, with amounts as
+  decimal strings. Prefer `decodeBurnMessage` on `message` when you need checked
+  values.
+</ResponseField>
+
+`IrisMessagesResponse` is the raw `{ messages: IrisMessage[] }` body.
+
+## `pollMessages`
+
+`pollMessages(query: GetMessagesQuery, options: PollMessageOptions): Promise<IrisMessage | null>`
+
+Calls `getMessages` until `isDone` holds or the time runs out. On timeout it returns the latest message it saw, or `null` if Iris never had one. Iris errors other than a rate limit are thrown; a slow attestation only times out.
+
+```ts
+import {
+  BaseSepolia,
+  attestationSeconds,
+  pollBudget,
+  pollMessages,
+  isForwardDone,
+} from "@usewhisk/cctp";
+
+const controller = new AbortController();
+
+const msg = await pollMessages(
+  { sourceDomain: BaseSepolia.cctpDomain, transactionHash: burnTxHash },
+  {
+    network: "testnet",
+    ...pollBudget(attestationSeconds(BaseSepolia, "fast")),
+    isDone: (m) => m.status === "complete",
+    onRateLimited: (retryAt) =>
+      console.warn("Iris rate limit, resuming at", new Date(retryAt)),
+    signal: controller.signal,
+  },
+);
+
+if (msg === null) {
+  console.log("Iris has not seen the burn yet");
+} else if (isForwardDone(msg)) {
+  console.log("Minted by Circle in", msg.forwardTxHash);
+}
+```
+
+<ParamField path="network" type='"mainnet" | "testnet"' required>
+  Picks the Iris host.
+</ParamField>
+<ParamField path="baseUrl" type="string">
+  Another Iris host or proxy.
+</ParamField>
+<ParamField path="intervalMs" type="number">
+  Time between requests. Defaults to `3000`.
+</ParamField>
+<ParamField path="timeoutMs" type="number">
+  Total time to poll. Defaults to 15 minutes. Here it is the whole poll, not the
+  per-request timeout.
+</ParamField>
+<ParamField path="isDone" type="(message: IrisMessage) => boolean">
+  When to stop. By default: for a forwarded burn, once `isForwardDone` holds or
+  `forwardState` is `"FAILED"`; otherwise once `status` is `"complete"`.
+</ParamField>
+<ParamField path="onRateLimited" type="(retryAt: number) => void">
+  Called when a 429 makes the poll stand down, with the resume time in
+  milliseconds since the epoch. The wait does not count against `timeoutMs`.
+</ParamField>
+<ParamField path="fetch" type="typeof fetch">
+  Your own `fetch`, for a proxy, test stub or custom agent.
+</ParamField>
+<ParamField path="limiter" type="IrisLimiter">
+  The rate limiter to share. Defaults to `defaultIrisLimiter`.
+</ParamField>
+<ParamField path="signal" type="AbortSignal">
+  Stops the poll with `IrisAbortedError`.
+</ParamField>
+
+`maxRetries` and `baseDelayMs` from the [request options](#request-options) apply to each request. The per-request `timeoutMs` cannot be set through `pollMessages`, because `timeoutMs` there means the whole poll; each request uses the 5 second default.
+
+### `pollBudget`
+
+`pollBudget(eta: SecondsRange): { intervalMs: number; timeoutMs: number }`
+
+Sizes a poll for a route whose attestation takes `eta` seconds, usually from [`attestationSeconds`](/reference/cctp/chains#attestation-times). Fast routes poll often so the payer hears at once; slow ones poll gently so they do not use up the shared rate limit.
+
+| `eta.max`    | `intervalMs` |
+| ------------ | ------------ |
+| 60 s or less | 2,000        |
+| up to 30 min | 10,000       |
+| longer       | 30,000       |
+
+`timeoutMs` is twice `eta.max` plus five minutes. A Base Fast transfer (`{ min: 8, max: 8 }`) gets `{ intervalMs: 2000, timeoutMs: 316000 }`.
+
+### `isForwardDone`
+
+`isForwardDone(message: IrisMessage): boolean`
+
+`true` when Circle's relayer has minted: `forwardState` is `"CONFIRMED"` or `"COMPLETE"` and `forwardTxHash` is set. A `PENDING` state can carry a hash that was never mined, so it does not count.
+
+### Custom host, fetch and limiter
+
+```ts
+import { pollMessages, createIrisLimiter } from "@usewhisk/cctp";
+
+const limiter = createIrisLimiter({ ratePerSecond: 10 });
+
+await pollMessages(
+  { sourceDomain: 6, nonce: "0x5e1f...nonce" },
+  {
+    network: "mainnet",
+    baseUrl: "https://iris-proxy.example.com",
+    fetch: (input, init) => fetch(input, { ...init, keepalive: true }),
+    limiter,
+    timeoutMs: 60_000,
+  },
+);
+```
+
+`baseUrl` is honored by `getMessages` and `pollMessages` only. The fee, quote, allowance and reattest calls always use `irisBaseUrl(network)`; give them a custom `fetch` if they need to go through a proxy.
+
+## `reattest`
+
+`reattest(nonce: string, options: ReattestOptions): Promise<{ nonce: string } | null>`
+
+`POST /v2/reattest/{nonce}` asks Circle to sign a message again, for one that expired before anyone minted it or a Fast message you want re-signed at finality. Circle only acknowledges the request; read the new attestation from `getMessages` by nonce. Returns `null` when Iris has no such nonce.
+
+```ts
+import { BaseSepolia, reattest, pollMessages } from "@usewhisk/cctp";
+
+const ack = await reattest(nonce, { network: "testnet" });
+if (ack) {
+  const fresh = await pollMessages(
+    { sourceDomain: BaseSepolia.cctpDomain, nonce },
+    { network: "testnet", isDone: (m) => m.status === "complete" },
+  );
+  console.log(fresh?.attestation);
+}
+```
+
+`ReattestOptions` is `{ network }` plus the [request options](#request-options).
+
+## Fees and quotes
+
+`getBurnFees(network, sourceDomain, destinationDomain, options?)` reads `GET /v2/burn/USDC/fees/{src}/{dst}`. It and `pickFeeTier`, `pickForwarderFee`, `FINALITY_FAST` and `FINALITY_STANDARD` are on the [fees page](/reference/cctp/fees).
+
+### Signed upfront-fee quotes
+
+`getSignedBurnQuote(network, sourceDomain, destinationDomain, request, options?): Promise<SignedBurnQuote>`
+
+`POST /v2/quote/burn/usdc/{src}/{dst}`. Circle's signed price for paying the Fast fee, the forwarding fee, or both on the source chain, on top of the amount. Only chains with `capabilities.upfrontFeeSource` accept it. Pass the result to [`buildBurnWithFeesIntent`](/reference/cctp/builders#buildburnwithfeesintent).
+
+`SignedBurnQuoteRequest`:
+
+| Field      | Type                        |                                                                          |
+| ---------- | --------------------------- | ------------------------------------------------------------------------ |
+| `amount`   | `bigint`                    | The burn amount, 6-decimal subunits. The quote is bound to it.           |
+| `feeToken` | `Address`                   | The source chain's USDC.                                                 |
+| `requests` | `readonly UpfrontFeeType[]` | `"PRE_FINALITY"` (the Fast fee) and/or `"FORWARD"` (the forwarding fee). |
+
+`SignedBurnQuote`:
+
+| Field            | Type                                         |                                                                                                                  |
+| ---------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `signedQuote`    | `` `0x${string}` ``                          | Submitted as is to `TokenMessengerWithFees`.                                                                     |
+| `feeTotalAmount` | `bigint`                                     | Total fee in 6-decimal subunits. The payer pays `amount + feeTotalAmount`.                                       |
+| `feeToken`       | `Address`                                    | The USDC address.                                                                                                |
+| `items`          | `{ type: UpfrontFeeType; amount: bigint }[]` | One line per requested fee. They add up to `feeTotalAmount`.                                                     |
+| `issuedAt`       | `number`                                     | Circle's clock, Unix seconds.                                                                                    |
+| `expiry`         | `SignedQuoteExpiry`                          | `{ mode: "TIMESTAMP"; expiresAt: number }` (Unix seconds) or `{ mode: "BLOCK_NUMBER"; expiresAtBlock: bigint }`. |
+| `burnAmount`     | `bigint`                                     | Optional; echoed by Circle when present.                                                                         |
+
+The client checks the reply before returning it: a quote for another amount, another fee token, a different set of fees, or items that do not add up throws `IrisParseError`. An expired quote reverts on chain, so ask for a fresh one right before the payer signs.
+
+### Fast Transfer allowance
+
+`getFastBurnAllowance(network, options?): Promise<bigint>`
+
+`GET /v2/fastBurn/USDC/allowance`: how much Fast Transfer volume Circle can still back right now, in 6-decimal subunits, rounded down. A Fast burn that does not fit shows `delayReason: "insufficient_allowance_available"` on its message until it is attested.
+
+```ts
+import {
+  getFastBurnAllowance,
+  irisBaseUrl,
+  IRIS_MAINNET_URL,
+  IRIS_SANDBOX_URL,
+  fetchIrisJson,
+} from "@usewhisk/cctp";
+
+const allowance = await getFastBurnAllowance("mainnet");
+console.log(`${allowance / 1_000_000n} USDC of Fast Transfer allowance left`);
+
+console.log(irisBaseUrl("testnet") === IRIS_SANDBOX_URL, IRIS_MAINNET_URL);
+
+const raw = await fetchIrisJson<unknown>(
+  `${irisBaseUrl("mainnet")}/v2/publicKeys`,
+  { timeoutMs: 10_000, maxRetries: 1 },
+);
+```
+
+## Request options
+
+Every Iris call goes through `fetchIrisJson<T>(url, options?)`, which you can also call for endpoints the client does not wrap. It returns the parsed JSON body unchecked, so validate it before use. `FetchJsonOptions`:
+
+| Option        | Default              |                                                             |
+| ------------- | -------------------- | ----------------------------------------------------------- |
+| `timeoutMs`   | `5000`               | Per request, in ms.                                         |
+| `maxRetries`  | `3`                  | Retries after the first attempt.                            |
+| `baseDelayMs` | `300`                | Delay before retry `n` is `baseDelayMs * n`.                |
+| `signal`      |                      | Aborts the request and all retries with `IrisAbortedError`. |
+| `fetch`       | global `fetch`       |                                                             |
+| `limiter`     | `defaultIrisLimiter` |                                                             |
+
+Server errors (5xx), network failures and timeouts are retried. Other 4xx responses, unparseable JSON and 429s are not.
+
+## Rate limiting
+
+Circle allows 35 requests a second per IP and blocks the IP for five minutes after a 429. The client keeps a token bucket per host and, after a 429, refuses every request to that host until the block ends instead of extending it.
+
+`defaultIrisLimiter` is one limiter shared by every Iris call in the process, because Circle counts per IP, not per caller. Make your own with `createIrisLimiter(options?)` only when you need different numbers, and share it across all your calls.
+
+`IrisLimiterOptions`:
+
+| Option          | Default      |                                   |
+| --------------- | ------------ | --------------------------------- |
+| `ratePerSecond` | `30`         | Below Circle's 35, to leave room. |
+| `standDownMs`   | `300000`     | How long to stop after a 429.     |
+| `now`           | `Date.now`   | Clock, for tests.                 |
+| `sleep`         | `setTimeout` | Wait, for tests.                  |
+
+An `IrisLimiter` has `acquire(host)` (waits for a slot, or throws `IrisRateLimitedError` while standing down), `standDown(host)` (records a 429 and returns the resume time), `now()` and `sleep(ms)`.
+
+If many servers share one outbound IP, they share Circle's limit too. Put a cache or a single poller in front of Iris rather than raising `ratePerSecond`.
+
+## Errors
+
+```ts
+import {
+  getMessages,
+  IrisError,
+  IrisHttpError,
+  IrisRateLimitedError,
+  IrisNetworkError,
+  IrisParseError,
+  IrisAbortedError,
+} from "@usewhisk/cctp";
+
+try {
+  await getMessages(
+    { sourceDomain: 0, transactionHash: "0xabc" },
+    { network: "mainnet", signal: AbortSignal.timeout(20_000) },
+  );
+} catch (err) {
+  if (err instanceof IrisRateLimitedError) {
+    console.log(err.host, new Date(err.retryAt));
+  } else if (err instanceof IrisHttpError) {
+    console.log(err.status, err.url, err.bodySnippet);
+  } else if (
+    err instanceof IrisNetworkError ||
+    err instanceof IrisParseError ||
+    err instanceof IrisAbortedError
+  ) {
+    console.log(err.code, err.cause);
+  } else if (err instanceof IrisError) {
+    console.log(err.code);
+  }
+}
+```
+
+All extend `IrisError`, which extends `CctpError`.
+
+| Class                  | Code                | When                                                                                                                                        |
+| ---------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IrisHttpError`        | `iris_http`         | A 4xx other than 429, or a 5xx after the retries. Carries `status`, `url` and `bodySnippet`.                                                |
+| `IrisRateLimitedError` | `iris_rate_limited` | Iris answered 429, or the limiter is still standing down. `retryAt` (ms since the epoch) and `host`. `pollMessages` waits these out itself. |
+| `IrisNetworkError`     | `iris_network`      | The network failed or timed out on every attempt. `cause` holds the last error.                                                             |
+| `IrisParseError`       | `iris_parse`        | The body was not JSON, or not the shape expected.                                                                                           |
+| `IrisAbortedError`     | `iris_aborted`      | Your `AbortSignal` fired.                                                                                                                   |
+
+An error from Iris says nothing about the payer's money. The burn is on chain either way; retry later, or find the message by transaction hash from another machine.

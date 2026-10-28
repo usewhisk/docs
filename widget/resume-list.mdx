@@ -1,0 +1,107 @@
+---
+title: ResumeList
+description: Lists bridges the engine kept between burn and mint, with a button to finish each one and a button to dismiss it.
+---
+
+A bridge burns USDC on the source chain before it mints on the destination. If the tab closes, the wallet drops the mint, or the network fails in between, the USDC is burned but not delivered. `ResumeList` shows those transfers so the payer can finish them.
+
+```tsx AccountPage.tsx
+import {
+  ResumeList,
+  WhiskProvider,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+
+export function AccountPage() {
+  return (
+    <WhiskProvider config={config}>
+      <ResumeList />
+    </WhiskProvider>
+  );
+}
+```
+
+`ResumeList` takes no props. It renders nothing when there is nothing to show.
+
+## When to render it
+
+[`WhiskSend`](/widget/whisk-send) already renders a `ResumeList` at the top of its card, so a page with the widget needs nothing more. Render your own when the payer may come back somewhere else:
+
+- an account, orders or wallet page,
+- a page that runs transfers with [hooks](/hooks/use-whisk) instead of the widget,
+- an app-wide banner, so an unfinished transfer is noticed on any page.
+
+It must be inside a [`WhiskProvider`](/widget/whisk-provider). It reads the engine's in-flight store once, when it mounts. A transfer that starts after that shows up the next time it mounts.
+
+## Where the records come from
+
+The engine writes a record when a bridge starts and updates it as the transfer moves: `signing` before the wallet returns the burn, `burned` once it has, `attested` once Circle signs the message, and `minted` when the mint lands. By default the store is `localStorage`, so records survive a reload or a closed tab on the same browser. Pass `inflightStore` to [`createWhiskConfig`](/reference/react/config) to keep them somewhere else.
+
+Only bridges are recorded; a same-chain send has nothing to finish. A bridge that fails before the burn leaves no record. Records of burned transfers never expire, and that includes delivered ones: a finished bridge stays in the list as "Delivered." until the payer dismisses it.
+
+## Each row
+
+A row shows the amount burned in USDC, the source and destination chains, and where the transfer stopped:
+
+| Record step | Row text                                                           |
+| ----------- | ------------------------------------------------------------------ |
+| `signing`   | Waiting for the wallet. If it sent the burn, resume from its hash. |
+| `burned`    | Burned. Waiting for Circle to attest.                              |
+| `attested`  | Attested. Ready to mint.                                           |
+| `minted`    | Delivered.                                                         |
+
+The amount is converted from the record's subunits with the source chain's USDC decimals (6, or 7 on Stellar).
+
+Undelivered rows have a **Resume** button. Every row has a **Dismiss** button.
+
+## What Resume does
+
+Resume calls `engine.resume` with the record. It does not sign the burn again, so it cannot charge the payer twice. It:
+
+1. checks the burn on the source chain (on an EVM source, a burn that reverted moved no USDC, so the record is removed),
+2. waits for Circle's attestation, and asks for a new one if the old one expired,
+3. mints on the destination, unless Circle's Forwarder mints it or the destination already received the funds.
+
+When the mint needs a destination wallet, Resume uses the connected wallet for the destination chain's ecosystem. If none is connected, the row shows the error and the payer can connect one and try again. On success the row turns into "Delivered." and the Resume button goes away.
+
+A `signing` record has no burn hash: the page closed before the wallet returned one. Resume fails with a message saying so. If the payer's wallet shows a burn for it, finish it from that hash with a [`WhiskReceipt`](/widget/whisk-receipt) or `engine.resumeFromTx`.
+
+## What Dismiss does
+
+Dismiss removes the record from the store. It does not touch any funds or cancel anything on chain. A burned transfer that is dismissed can still be finished later from its burn hash, but it no longer appears in the list.
+
+## Showing it only when needed
+
+`ResumeList` already renders nothing when the store is empty. To wrap it in your own heading, read the store yourself:
+
+```tsx PendingTransfers.tsx
+import { useEffect, useState } from "react";
+import { ResumeList, useWhiskEngine } from "@usewhisk/react";
+
+export function PendingTransfers() {
+  const engine = useWhiskEngine();
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    engine.inflight().then((records) => {
+      setCount(records.filter((r) => r.step !== "minted").length);
+    }, console.error);
+  }, [engine]);
+
+  if (count === 0) return null;
+  return (
+    <section>
+      <h3>{count} transfer(s) need finishing</h3>
+      <ResumeList />
+    </section>
+  );
+}
+```
+
+See [recovery](/concepts/recovery) for the full model, including what happens when an attestation expires.

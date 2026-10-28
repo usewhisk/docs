@@ -1,0 +1,301 @@
+---
+title: Quotes and fees
+description: What a quote contains, how each fee is worked out, and why send can refuse a quote the payer confirmed.
+---
+
+A quote is the exact transfer the payer is asked to confirm: what they pay, what the recipient gets at least, every fee, and the subunits `send` will sign. It is valid for 60 seconds.
+
+```ts
+import { createWhisk, type EvmAdapter } from "@usewhisk/core";
+
+declare const adapter: EvmAdapter;
+
+const engine = createWhisk({ chains: ["Base_Sepolia", "Arc_Testnet"] });
+
+const recipient = await engine.resolve(
+  "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  "Arc_Testnet",
+);
+const quote = await engine.quote({
+  sourceChain: "Base_Sepolia",
+  destinationChain: "Arc_Testnet",
+  recipient,
+  amount: "100",
+  adapter,
+});
+
+console.log(`You pay ${quote.amountIn} USDC`);
+console.log(`Recipient gets at least ${quote.amountOut} USDC`);
+for (const fee of quote.fees.entries) {
+  console.log(fee.kind, fee.amount, fee.description);
+}
+console.log(`Valid until ${new Date(quote.expiresAt).toISOString()}`);
+```
+
+<Note>
+  Whisk moves USDC only. `QuoteParams.token` and `WhiskConfig.token` exist in
+  the types, but in 0.3 they do not change what moves; they only change the
+  symbol written on the quote and its fee lines. Leave them unset. This is
+  tracked in [usewhisk/whisk#155](https://github.com/usewhisk/whisk/issues/155).
+</Note>
+
+## What a quote contains
+
+<ResponseField name="id" type="string">
+  New for every quote, including a refreshed one. A bridge's in-flight record uses it as its id.
+</ResponseField>
+<ResponseField name="issuedAt / expiresAt" type="number">
+  Milliseconds since the epoch. `expiresAt` is 60 seconds after `issuedAt`.
+</ResponseField>
+<ResponseField name="amountIn" type="string">
+  The most the payer is debited, merchant fee included. Show it as "You pay".
+</ResponseField>
+<ResponseField name="amountOut" type="string">
+  The least the recipient receives. Show it as "Recipient gets".
+</ResponseField>
+<ResponseField name="amountBurned" type="string">
+  The amount burned on the source chain. On a same-chain send it equals the amount sent.
+</ResponseField>
+<ResponseField name="fees" type="FeeBreakdown">
+  `entries` (one `FeeEntry` per fee line) and `total`, the sum of the entries in USDC.
+</ResponseField>
+<ResponseField name="feeMode" type='"maxFee" | "upfront"'>
+  How Circle's fee is paid. See [fee modes](#fee-modes).
+</ResponseField>
+<ResponseField name="subunits" type="QuoteSubunits">
+  The `bigint` values behind the strings. `send` signs these.
+  <Expandable title="fields">
+    <ResponseField name="requested" type="bigint">The amount the payer entered.</ResponseField>
+    <ResponseField name="amountIn" type="bigint">Debited from the payer, merchant fee included.</ResponseField>
+    <ResponseField name="burnAmount" type="bigint">Burned on the source. `0n` on a same-chain send.</ResponseField>
+    <ResponseField name="burnFee" type="bigint">Circle's protocol fee as quoted, before the Fast buffer.</ResponseField>
+    <ResponseField name="forwarderFee" type="bigint">Circle's forwarding fee, `0n` when a wallet mints.</ResponseField>
+    <ResponseField name="maxFee" type="bigint">The cap on Circle's fees: buffered protocol fee plus forwarding fee.</ResponseField>
+    <ResponseField name="amountOut" type="bigint">The least the recipient gets.</ResponseField>
+    <ResponseField name="customFee" type="bigint">The merchant fee, `0n` without a fee policy.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="route" type="Route">
+  `{ kind: "send", chain }` or `{ kind: "bridge", sourceChain, destinationChain }`.
+</ResponseField>
+<ResponseField name="recipient" type="ResolvedRecipient">
+  The resolved recipient the quote pays.
+</ResponseField>
+<ResponseField name="plan" type="RoutePlan">
+  Bridges only: speed, who mints, and the ETA. See [how it works](/concepts/how-it-works).
+</ResponseField>
+<ResponseField name="estimatedDurationMs" type="number">
+  Circle's upper attestation time for a bridge, or 15 seconds for a same-chain send.
+</ResponseField>
+
+All amounts are USDC. The strings are derived from `subunits`; see [amounts and units](/concepts/amounts-and-units).
+
+## Fee lines
+
+Each `FeeEntry` has a `kind`, an `amount` (decimal string), a `token`, and optionally a `recipient` and a `description`.
+
+| `kind`      | Description on the quote                             | Who gets it                                                        |
+| ----------- | ---------------------------------------------------- | ------------------------------------------------------------------ |
+| `protocol`  | "CCTP protocol fee", or "CCTP protocol fee, at most" | Circle, for the attestation. Bridges only.                         |
+| `forwarder` | "Destination mint fee"                               | Circle's forwarder, spent as gas on the destination. Bridges only. |
+| `custom`    | "Merchant fee (90%)" and "Whisk platform fee (10%)"  | Your `feePolicy.recipient` and the Whisk treasury.                 |
+| `gas`       | Not produced in 0.3                                  |                                                                    |
+| `provider`  | Not produced in 0.3                                  |                                                                    |
+
+The payer's network gas (ETH on Base, SOL on Solana, and so on) is not a fee line. On Arc, where gas is USDC, it is not on the quote either; see [Arc gas](/concepts/amounts-and-units#arc-usdc-is-the-gas-token).
+
+A same-chain send has no protocol or forwarder fee. Its only possible fee line is the merchant fee.
+
+## How bridge fees are worked out
+
+For a bridge, Whisk reads Circle's fee tiers from Iris for the source and destination domains and computes, in subunits:
+
+```text
+burnFee      = burnAmount x Circle's rate for the speed, rounded up
+               (on Standard routes from fee-switch chains: the larger of that
+               and the source's on-chain getMinFeeAmount)
+forwarderFee = Circle's forwarding fee at the chosen level, 0 when a wallet mints
+maxFee       = burnFee + 10% on Fast routes (rounded up) + forwarderFee
+```
+
+**The Fast buffer.** On a Fast route, `maxFee` carries 10% over the protocol fee Iris quotes. If `maxFee` turns out too low for Fast when the burn lands, Circle attests the transfer as Standard instead: no USDC is lost, but a transfer from Ethereum or an OP-stack chain takes 15 to 19 minutes instead of seconds. The buffer stops a small fee rise from doing that. Circle only ever takes the fee it executes, so on the `maxFee` path any unused part of the buffer reaches the recipient, not the payer.
+
+**Forwarder fee level.** Circle prices forwarding at several levels. Whisk uses `high`, which costs a fraction of a cent more than `med` into most chains and protects the mint against a gas rise. Into Ethereum (and Ethereum Sepolia) it uses `med`, because `high` costs about 0.30 USDC more there and all of it is spent as gas. A forwarding fee that proves too low delays the mint but does not lose the USDC; see [recovery](/concepts/recovery).
+
+```ts
+import { createWhisk } from "@usewhisk/core";
+
+const engine = createWhisk({
+  chains: ["Base", "Arc", "Ethereum"],
+  feeBearer: "sender",
+  forwarderFeeLevel: "high",
+  feePolicy: {
+    value: "0.25",
+    recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  },
+});
+```
+
+`forwarderFeeLevel` (`"med"` or `"high"`) overrides the default for every destination. It is a `createWhisk` option; `WhiskClientConfig` in `@usewhisk/react` does not have it in 0.3.
+
+## Who pays: feeBearer
+
+`feeBearer` decides who absorbs Circle's protocol and forwarding fees on a bridge. It has no effect on same-chain sends.
+
+<Tabs>
+  <Tab title='"sender" (default)'>
+    The burn is sized up so the recipient nets at least the amount the payer entered.
+
+    - `burnAmount` is the amount plus `maxFee`, recomputed once more if the larger burn raises the fee.
+    - `amountIn` (the payer's debit) is `burnAmount`, plus any merchant fee.
+    - `amountOut` is at least the amount entered. Because the fee is read at quote time, the delivered amount can be a few cents above it when Circle takes less than `maxFee`.
+    - On the [upfront fee path](#fee-modes) the burn is the amount entered, the fee is paid beside it, and `amountIn` is the amount plus `maxFee` plus any merchant fee. The recipient gets exactly the amount entered.
+
+  </Tab>
+  <Tab title='"receiver"'>
+    The fees come out of the bridged amount.
+
+    - `burnAmount` is the amount entered.
+    - `amountIn` is the amount entered, plus any merchant fee.
+    - `amountOut` is the amount minus `maxFee`. The recipient gets at least that.
+    - `quote` throws `ConfigError` when the fees are larger than the amount.
+    - Receiver-pays always uses the `maxFee` fee mode.
+
+  </Tab>
+</Tabs>
+
+## Fee modes
+
+**`maxFee`.** The burn carries `maxFee` as a cap, and Circle deducts the fee it executes from the burned amount when it mints.
+
+**`upfront`.** The payer pays Circle's fee beside the burn through Circle's `TokenMessengerWithFees`, and the whole burn mints. Whisk uses it when all of these hold:
+
+- the source is an EVM chain with Circle's upfront fees (`capabilities.upfrontFeeSource`: 18 mainnets and 17 testnets, including Base, Ethereum, Arbitrum and Arc);
+- `feeBearer` is `"sender"`;
+- the destination is not Stellar;
+- there is a fee to pay: the route is Fast, or Circle forwards it and the Standard protocol fee is zero.
+
+On the upfront path the quote shows Circle's estimated fee (buffer included) as the most the payer pays, and `amountOut` is exactly the amount entered. At send time Whisk fetches Circle's signed fee quote, which lasts about two minutes. The payer pays the signed fee, which is at or below the shown one. The approval covers the burn plus the shown fee. Upfront fees are not refunded by Circle.
+
+## Merchant fees: FeePolicy
+
+A `feePolicy` adds a fixed USDC fee on top of every transfer, paid by the sender whatever `feeBearer` says.
+
+- `value` is a decimal USDC string, such as `"0.25"`. `bps` is accepted by the type but ignored; percentage fees are not supported in 0.3.
+- Whisk splits `value` 90/10 between `recipient` and the Whisk treasury (`WHISK_TREASURY_ADDRESS`), rounding the treasury share down. The split never changes what the payer pays.
+- Each share is its own USDC `transfer` from the payer's wallet, sent with the burn or the same-chain transfer in one atomic batch, or after it has landed. Never before.
+- `recipient` must be an EVM address. `send` refuses an invalid one with `ConfigError` before anything is signed.
+
+<Warning>
+  In 0.3 the merchant fee is collected only when the source chain is EVM. On
+  Solana, Stellar and Starknet sources the quote still lists the fee and
+  includes it in `amountIn`, but no fee transfer is sent. Do not rely on
+  `feePolicy` for payers sending from those chains.
+</Warning>
+
+### When the fee is paid
+
+On an EVM source, the engine asks the adapter's `supportsAtomicBatch` about the source chain first:
+
+- **Yes:** the approve, the burn and the fee shares (or the transfer and the fee shares) go in one `sendCalls` with `atomic: true`, as one EIP-5792 batch. The wallet lands all of them or none. If the adapter turns the batch down with a `WalletCapabilityError` of category `atomic_unsupported`, the engine sends them as below instead.
+- **No, or no `supportsAtomicBatch`:** the burn or transfer goes alone, as it would without a fee. Once its receipt is a success, the engine asks for each fee share as its own request, before waiting for the attestation. A rejected or reverted fee does not fail the transfer.
+
+`useEvmAdapter` answers from wagmi's `getCapabilities`. On Arc the engine sets a gas price on every call, which a batch cannot carry, so the React adapter turns the batch down and the fee is asked for after the burn.
+
+The result says what happened. With a fee policy on an EVM source, `SendSuccess` and `SendFailure` both carry `customFee`:
+
+| `customFee`                                     | Meaning                                                                                      |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `{ status: "paid", txHashes, amount }`          | The fee landed. `txHashes` are its transactions, or the batch's one hash when it shares one. |
+| `{ status: "unpaid", amount, error }`           | The burn or transfer landed, then the payer rejected the fee or it reverted.                 |
+| `{ status: "unpaid", amount, error, txHashes }` | The payer stopped after the first share; `txHashes` lists the share that landed.             |
+| `{ status: "unpaid", amount }`                  | The fee was never asked for, because the burn or transfer did not land.                      |
+
+`amount` is the whole fee as a decimal USDC string. A transfer resumed from its in-flight record reports the fee from the record and never asks for it again.
+
+```ts
+import type { SendSuccess } from "@usewhisk/core";
+
+export function feeSettled(result: SendSuccess): boolean {
+  return result.customFee === undefined || result.customFee.status === "paid";
+}
+```
+
+<Warning>
+  On a wallet without atomic batches, a payer can reject the fee prompt and keep
+  the transfer. If you fulfil orders from `onSuccess`, check
+  `result.customFee.status` first. See [fund
+  safety](/concepts/fund-safety#known-gaps).
+</Warning>
+
+## Bound quotes
+
+`send` signs what the payer saw or nothing. Before any signature it checks, in order:
+
+1. the quote is not past `expiresAt`, else it throws `QuoteExpiredError`;
+2. on EVM sources, the payer's USDC covers `subunits.amountIn` (plus the [Arc gas reserve](/concepts/amounts-and-units#arc-usdc-is-the-gas-token)), else it throws `InsufficientBalanceError`;
+3. the route plan is the same: same speed and same minter, else it throws `QuoteChangedError`;
+4. on the `maxFee` path, Circle's current fee for the quoted burn (the unbuffered protocol fee plus the `med` forwarding fee) still fits under `subunits.maxFee`, else it throws `QuoteChangedError`;
+5. on the `upfront` path, Circle's signed fee is at or below the shown fee, else it throws `QuoteChangedError`. An expired signed quote is fetched once more before `send` gives up with `QuoteExpiredError`.
+
+The burn then uses `subunits.burnAmount` and `subunits.maxFee` exactly. Nothing between the screen and the signature recomputes them.
+
+`QuoteChangedError` carries `previous` (the confirmed quote) and `quote` (a fresh one built from the same inputs). Show the fresh quote and ask the payer to confirm again. `QuoteExpiredError` carries the expired `quote`; build a new one from the same parameters.
+
+```ts
+import {
+  QuoteChangedError,
+  QuoteExpiredError,
+  type Quote,
+  type QuoteParams,
+  type SendResult,
+  type WhiskEngine,
+} from "@usewhisk/core";
+
+export async function payWithConfirmation(
+  engine: WhiskEngine,
+  params: QuoteParams,
+  confirm: (quote: Quote, previous?: Quote) => Promise<boolean>,
+): Promise<SendResult | null> {
+  let quote = await engine.quote(params);
+  let previous: Quote | undefined;
+
+  for (;;) {
+    if (!(await confirm(quote, previous))) return null;
+    try {
+      return await engine.send({
+        quote,
+        adapter: params.adapter,
+        ...(params.destinationAdapter && {
+          destinationAdapter: params.destinationAdapter,
+        }),
+      });
+    } catch (err) {
+      if (err instanceof QuoteChangedError) {
+        previous = err.previous;
+        quote = err.quote;
+        continue;
+      }
+      if (err instanceof QuoteExpiredError) {
+        previous = undefined;
+        quote = await engine.quote(params);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+```
+
+`<WhiskSend>` does this for you. It fetches a new quote 5 seconds before the current one expires while the form is open, re-quotes on `QuoteExpiredError`, and on `QuoteChangedError` shows the new quote next to the old one for the payer to confirm.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Amounts and units" href="/concepts/amounts-and-units">
+    Strings, subunits and the Arc gas reserve.
+  </Card>
+  <Card title="CCTP fees reference" href="/reference/cctp/fees">
+    The fee math in `@usewhisk/cctp`.
+  </Card>
+</CardGroup>

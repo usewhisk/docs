@@ -1,0 +1,282 @@
+---
+title: WhiskSend
+description: The drop-in USDC widget, with a Send tab for same-chain transfers and a Bridge tab for CCTP V2 transfers between chains.
+---
+
+`WhiskSend` is the whole payment flow in one component: wallet connection, recipient, amount, quote, send and result. Render it anywhere inside a [`WhiskProvider`](/widget/whisk-provider).
+
+```tsx Pay.tsx
+import { WhiskSend } from "@usewhisk/react";
+
+export function Pay() {
+  return <WhiskSend />;
+}
+```
+
+The Send tab moves USDC on one chain. The Bridge tab burns USDC on the source chain and mints it on the destination through CCTP V2. The source chain's ecosystem decides which connected wallet pays.
+
+## Props
+
+All props are optional.
+
+<ParamField
+  path="tabs"
+  type={'ReadonlyArray<"send" | "bridge">'}
+  default='["send", "bridge"]'
+>
+  Which tabs to show. With one entry the tab bar is hidden and only that form
+  renders. An empty array falls back to both tabs.
+</ParamField>
+
+<ParamField path="title" type="string" default='"Send USDC"'>
+  Heading at the top of the card.
+</ParamField>
+
+<ParamField path="description" type="ReactNode">
+  Shown under the title.
+</ParamField>
+
+<ParamField path="amount" type="string">
+  Locks the amount to this decimal USDC string, such as `"49.99"`. The payer's
+  edits are ignored.
+</ParamField>
+
+<ParamField path="defaultAmount" type="string">
+  Prefills the amount. The payer can change it.
+</ParamField>
+
+<ParamField path="recipient" type="string">
+  Locks the recipient. Any input the resolver accepts: an address on the
+  destination chain, or an ENS name with the default resolver.
+</ParamField>
+
+<ParamField path="defaultRecipient" type="string">
+  Prefills the recipient. The payer can change it.
+</ParamField>
+
+<ParamField path="sourceChain" type="Chain">
+  Locks the source chain.
+</ParamField>
+
+<ParamField path="defaultSourceChain" type="Chain">
+  The source chain the widget starts on. Falls back to
+  `config.defaultSourceChain`, then the first entry in `config.chains`.
+</ParamField>
+
+<ParamField path="destinationChain" type="Chain">
+  Locks the destination chain of the Bridge tab.
+</ParamField>
+
+<ParamField path="defaultDestinationChain" type="Chain">
+  The destination the Bridge tab starts on. Falls back to
+  `config.defaultDestinationChain`, then the first other chain in
+  `config.chains`.
+</ParamField>
+
+<ParamField path="onSuccess" type="(result: SendSuccess) => void">
+  Called once a transfer settles. See [callbacks](#callbacks).
+</ParamField>
+
+<ParamField path="onFailure" type="(result: SendFailure) => void">
+  Called when the engine returns a failed transfer. See [callbacks](#callbacks).
+</ParamField>
+
+## Locked and prefilled fields
+
+Each field has two props. The plain one (`amount`, `recipient`, `sourceChain`, `destinationChain`) locks the field to your value, and edits are ignored. The `default*` one only sets the starting value.
+
+Lock everything for a checkout where the payer reviews and pays:
+
+```tsx Checkout.tsx
+import { WhiskSend } from "@usewhisk/react";
+
+export function Checkout() {
+  return (
+    <WhiskSend
+      tabs={["bridge"]}
+      title="Pay for order #1042"
+      description="Pay from any supported chain. The store receives USDC on Base."
+      amount="49.99"
+      recipient="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+      destinationChain="Base_Sepolia"
+      defaultSourceChain="Arc_Testnet"
+      onSuccess={(result) => console.log("paid", result.finalTxHash)}
+    />
+  );
+}
+```
+
+Or prefill and leave the rest open, as for a tip jar:
+
+```tsx Donate.tsx
+import { WhiskSend } from "@usewhisk/react";
+
+export function Donate() {
+  return (
+    <WhiskSend
+      tabs={["send"]}
+      title="Tip the author"
+      defaultAmount="5"
+      recipient="author.eth"
+      defaultSourceChain="Base_Sepolia"
+    />
+  );
+}
+```
+
+A locked value can come from your own state. When it changes, the widget re-resolves and re-quotes. There are no change callbacks, so the widget cannot report the payer's edits back to you; lock a field when your app owns it, prefill it when the payer does.
+
+```tsx Subscribe.tsx
+import { useState } from "react";
+import { WhiskSend } from "@usewhisk/react";
+
+const PLANS = { monthly: "9.00", yearly: "90.00" } as const;
+
+export function Subscribe() {
+  const [plan, setPlan] = useState<keyof typeof PLANS>("monthly");
+  return (
+    <>
+      <select
+        value={plan}
+        onChange={(e) => setPlan(e.target.value as keyof typeof PLANS)}
+      >
+        <option value="monthly">Monthly</option>
+        <option value="yearly">Yearly</option>
+      </select>
+      <WhiskSend
+        amount={PLANS[plan]}
+        recipient="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"
+      />
+    </>
+  );
+}
+```
+
+Changing a `default*` prop after the first render has no effect.
+
+The destination list only offers chains on the source chain's network, so a payer can never bridge from testnet to mainnet. If the source changes and rules out the current destination, the widget moves to the first chain that fits.
+
+## What the payer sees
+
+<Steps>
+  <Step title="Connect">
+    Without a connected wallet for the source chain, the header and the main
+    button both read "Connect wallet" and open the [connect
+    modal](/widget/connect-modal). Once connected, the header shows the address
+    and the wallet or network name; clicking it opens the modal again. Any
+    [transfers left between burn and mint](/widget/resume-list) are listed at
+    the top of the card.
+  </Step>
+  <Step title="Recipient and amount">
+    The recipient is resolved 320 ms after the payer stops typing. A resolved
+    ENS name shows as `name.eth → 0x1234…abcd` under the field; an input the
+    resolver rejects shows its error there. The amount is a decimal USDC string.
+  </Step>
+  <Step title="Quote">
+    With a resolved recipient, an amount and a wallet, the widget asks the
+    engine for a quote and shows it: "Recipient gets" (or "Recipient receives"
+    on the Send tab), "You pay" on a bridge, and one row per fee (protocol fee,
+    destination mint fee, merchant fee). A quote lasts a minute; the widget
+    fetches a new one five seconds before it expires, so the payer never signs a
+    stale one. Errors from quoting, such as a destination wallet that must be
+    connected, show under the amount field. For a Starknet address with no
+    account deployed, the widget shows a warning with an "It's my wallet,
+    continue" button instead, and quotes once the payer presses it. See [quotes
+    and fees](/concepts/quotes-and-fees) and
+    [recipients](/concepts/recipients#starknet-felt-addresses).
+  </Step>
+  <Step title="Send">
+    The button reads "Send USDC" or "Bridge USDC". While the transfer runs it
+    reads "Sending…" and is disabled, and the wallet asks for each signature in
+    turn (approval, burn or transfer, and the mint when Circle does not forward
+    it). With a merchant fee, a wallet that supports atomic batches signs the
+    burn and the fee in one prompt; any other wallet is asked for the fee after
+    the burn or transfer lands. The payer is charged exactly the quote on
+    screen.
+  </Step>
+  <Step title="Result">
+    On success an info banner reads "Sent." with the final transaction hash. If
+    the payer did not pay the merchant fee, the banner adds "The 0.25 USDC fee
+    was not paid", with the reason. On failure an error banner shows the error
+    message. Editing any field clears the result and starts a new transfer.
+  </Step>
+</Steps>
+
+`WhiskSend` does not draw a step-by-step progress rail during the send in 0.3. To show one, run the send yourself and render [`StepRail`](/widget/primitives#steprail), or show a [`WhiskReceipt`](/widget/whisk-receipt) after the burn.
+
+### When fees rise
+
+Fees are checked again when the payer presses send. If they went up since the quote, nothing is signed. The widget swaps in the new quote, shows a warning with the old and new amounts the payer pays and the recipient gets, and the button changes to "Confirm new fees". A second press sends at the new quote.
+
+If the quote expired by the time the payer pressed send, the widget fetches a fresh one and the payer presses again. No funds move in either case.
+
+### Errors before anything is signed
+
+Some checks run before the first signature, such as whether the payer's USDC covers the quote. They show as an error banner with the message, and the banner carries a `data-whisk-error` attribute with the [error code](/concepts/errors). No funds have moved.
+
+## The Max button
+
+When the widget knows the payer's balance, the amount field shows "Balance 123.45 USDC" and a **Max** button. Max asks the engine for the largest amount the wallet can send on the current route: the balance less the fees the payer covers and, on Arc, the USDC kept back for gas. With `feeBearer: "sender"` (the default) the fees come on top of the amount, so Max is lower than the balance.
+
+<Warning>
+  The balance is only read when the source chain is an EVM chain. On Solana,
+  Stellar and Starknet sources there is no balance line and no Max button, and
+  the payer types the amount. This is tracked in
+  [usewhisk/whisk#157](https://github.com/usewhisk/whisk/issues/157).
+</Warning>
+
+Max fills the field through the same path as typing, so it has no effect when `amount` is locked.
+
+## Callbacks
+
+`onSuccess` receives a `SendSuccess`, `onFailure` a `SendFailure`. Both carry the `steps` the engine ran, each with its `txHash` where there is one.
+
+```tsx Pay.tsx
+import { WhiskSend, type SendFailure, type SendSuccess } from "@usewhisk/react";
+
+function onSuccess(result: SendSuccess) {
+  const burn = result.steps.find(
+    (s) => s.name === "burn" || s.name === "transfer",
+  );
+  console.log("source tx", burn?.txHash, "final tx", result.finalTxHash);
+}
+
+function onFailure(result: SendFailure) {
+  console.error(result.error.code, result.error.message);
+  const burned = result.steps.some(
+    (s) => s.name === "burn" && s.state === "success",
+  );
+  if (burned) {
+    console.warn("USDC was burned but not minted yet; it can be resumed.");
+  }
+}
+
+export function Pay() {
+  return <WhiskSend onSuccess={onSuccess} onFailure={onFailure} />;
+}
+```
+
+- `onSuccess` fires once the transfer settles: the mint has landed, or the same-chain transfer is confirmed. `finalTxHash` is the last transaction (the mint, or the transfer).
+- `onFailure` fires when a transfer that started fails: a rejected signature, a revert, a failed mint. If the burn succeeded, the USDC is not lost. The engine kept a record, and the payer can finish it from the [resume list](/widget/resume-list) or a [receipt](/widget/whisk-receipt). See [recovery](/concepts/recovery).
+- Neither fires for the fee-rise prompt, an expired quote, or a check that fails before the first signature. Those stay inside the widget.
+
+With a `feePolicy`, `onSuccess` can fire with the fee unpaid: a payer whose wallet has no atomic batches can reject the fee request and keep the transfer. Check `result.customFee?.status` before you treat the fee as collected. See [when the fee is paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+Treat `onSuccess` as a signal to update your UI, not as proof of payment. Confirm payments on your server. See [checkout](/flows/checkout).
+
+## Cross-ecosystem bridges
+
+A bridge between ecosystems may need a wallet on both sides. When the source is an EVM chain or Solana and the destination is an EVM chain Circle forwards to, Circle's Forwarder signs the mint, so a payer bridging from Solana to Base only signs on Solana. Every other cross-ecosystem bridge (into Solana, Stellar or Starknet, or out of Stellar or Starknet into an EVM chain) needs a connected wallet on the destination to sign the mint. Until there is one, the quote fails with "Connect a … wallet to finish the transfer on …" under the amount field.
+
+<Note>
+  In 0.3 the connect modal only offers new connections while no wallet is
+  connected. Once the payer has connected one wallet, the modal shows that
+  account and a Disconnect button, with no way to add a second ecosystem. For
+  routes that need two wallets, connect the second ecosystem from your own UI
+  (for Solana, `useWallet` from `@solana/wallet-adapter-react` works inside the
+  provider).
+</Note>
+
+## Styling
+
+The card uses the `--whisk-*` variables from `@usewhisk/react/styles.css`, which you must import once. See [theming](/theming/overview). The "Powered by Whisk" line at the bottom cannot be hidden with CSS.

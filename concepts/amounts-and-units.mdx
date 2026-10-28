@@ -1,0 +1,160 @@
+---
+title: Amounts and units
+description: How Whisk represents USDC amounts, and how to convert between what payers type and what wallets sign.
+---
+
+USDC amounts cross Whisk's API as decimal strings such as `"12.5"` and live inside it as `bigint` subunits, with 6 decimals. Convert with `parseUsdcAmount` and `formatUsdcAmount`, and never put money in a JavaScript `number`.
+
+```ts
+import {
+  USDC_DECIMALS,
+  formatUsdcAmount,
+  parseUsdcAmount,
+} from "@usewhisk/core";
+
+const subunits = parseUsdcAmount("12.5"); // 12500000n
+const display = formatUsdcAmount(subunits); // "12.5"
+
+console.log(USDC_DECIMALS, subunits, display); // 6 12500000n "12.5"
+```
+
+## Strings at the edge, bigints inside
+
+| Where                                                                                        | Unit                                     |
+| -------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `QuoteParams.amount`, `FeePolicy.value`, refund amounts                                      | Decimal string, such as `"1.50"`         |
+| `Quote.amountIn`, `amountOut`, `amountBurned`, every `FeeEntry.amount`, `FeeBreakdown.total` | Decimal string, for display              |
+| `Quote.subunits.*`                                                                           | `bigint`, 6-decimal subunits             |
+| `engine.balance()`, `MaxSendable.balance`, `MaxSendable.gasReserve`                          | `bigint`, 6-decimal subunits             |
+| `MaxSendable.amount`                                                                         | Decimal string, ready for `quote`        |
+| `InflightRecord.amountBurned`                                                                | Subunit string, so the record stays JSON |
+
+The strings on a quote are derived from its `subunits`, and `send` signs the subunits. When you need to compare or add amounts, use the `bigint` fields. When you show them, use the strings or `formatUsdcAmount`.
+
+## parseUsdcAmount
+
+`parseUsdcAmount(input)` turns what a payer typed into subunits:
+
+- it trims whitespace and accepts digits with at most one dot and digits on both sides of it: `"5"`, `"0.75"` and `"1000.000001"` parse, `"5."` and `".5"` do not;
+- it rejects signs, exponents, commas and anything else (`"-1"`, `"1e3"`, `"1,000"`) with a `ConfigError`;
+- it rejects zero, since every transfer must move something;
+- digits past the sixth decimal are truncated, not rounded, so the payer is never debited more than they typed: `"1.2345678"` becomes `1234567n`.
+
+`formatUsdcAmount(subunits)` goes the other way and strips trailing zeros: `1500000n` becomes `"1.5"`, `2000000n` becomes `"2"`. It throws on a negative value.
+
+<Tip>
+  `formatUsdcAmount` gives an exact string, not a localised one. For display
+  with thousands separators or a fixed number of decimals, format the string
+  yourself; converting it to a `number` first loses precision on large amounts.
+</Tip>
+
+## Doing arithmetic
+
+Do arithmetic on `bigint` subunits, and format once at the end.
+
+```ts
+import { formatUsdcAmount, parseUsdcAmount } from "@usewhisk/core";
+
+const price = parseUsdcAmount("19.99");
+const quantity = 3n;
+const total = price * quantity; // 59970000n
+
+const perPerson = total / 4n; // 14992500n
+const remainder = total % 4n; // 0n
+
+console.log(formatUsdcAmount(total), formatUsdcAmount(perPerson), remainder);
+// "59.97" "14.9925" 0n
+```
+
+`bigint` division rounds toward zero. Decide who gets the remainder before you split an amount between several recipients.
+
+<Warning>
+  `0.1 + 0.2` is not `0.3` in floating point. A float anywhere between the
+  payer's input and the signature can move the amount by a subunit or, after a
+  few operations, more. Whisk's own code has no float math on money, and code
+  that feeds it should not either.
+</Warning>
+
+## Stellar: 7 decimals
+
+Stellar's USDC asset has 7 decimals. CCTP messages always carry 6. Whisk keeps every amount in 6-decimal subunits, including on Stellar, and scales at the edge:
+
+- **Sending from Stellar.** The engine multiplies the burn amount and `maxFee` by 10 when it builds the Soroban call. Circle's contract drops the seventh decimal again to produce the 6-decimal message amount. Because `parseUsdcAmount` already truncates to 6 decimals, no dust is lost.
+- **Bridging into Stellar.** The mint multiplies the 6-decimal message amount by 10. The recipient's trustline balance shows the same value with one more decimal place.
+- **Same-chain sends on Stellar.** The 6-decimal amount is scaled to 7 when the transfer is submitted.
+
+`engine.balance()` returns `null` on Stellar, so a raw trustline balance only reaches your code when you read it yourself. Convert it with the helpers from `@usewhisk/cctp` before you mix it with Whisk amounts:
+
+```ts
+import {
+  canonicalToStellarSubunits,
+  stellarSubunitsToCanonical,
+} from "@usewhisk/cctp";
+import { formatUsdcAmount } from "@usewhisk/core";
+
+const trustlineBalance = 123_456_789n; // 12.3456789 USDC, 7 decimals
+const canonical = stellarSubunitsToCanonical(trustlineBalance); // 12345678n
+
+console.log(formatUsdcAmount(canonical), canonicalToStellarSubunits(canonical));
+// "12.345678" 123456780n
+```
+
+`stellarSubunitsToCanonical` rounds toward zero; the seventh decimal stays in the Stellar account.
+
+## Arc: USDC is the gas token
+
+On Arc, gas is paid in USDC. The same balance appears two ways:
+
+- as Arc's native token, with 18 decimals, which is what gas prices and `maxFeePerGas` are counted in;
+- through the USDC ERC-20 contract, with 6 decimals, which is what Whisk reads and transfers.
+
+A payer on Arc spends USDC on both the transfer and its gas, so Whisk keeps some back:
+
+- `send` refuses with `InsufficientBalanceError` when the balance cannot cover the quote's `amountIn` plus a gas reserve.
+- `maxSendable` returns the largest amount that leaves the reserve in place.
+
+The reserve is a generous gas limit (100,000 gas for a same-chain send, 400,000 for a bridge) times Arc's current gas price plus 25%, never below Arc's 20 gwei floor, converted from 18 decimals to 6 and rounded up. At the floor that is 0.002 USDC for a send and 0.008 USDC for a bridge. Every transaction Whisk sends on Arc also carries a `maxFeePerGas` at or above that floor, because Arc drops transactions offering less.
+
+```ts
+import {
+  createWhisk,
+  formatUsdcAmount,
+  type EvmAdapter,
+  type ResolvedRecipient,
+} from "@usewhisk/core";
+
+declare const adapter: EvmAdapter;
+declare const recipient: ResolvedRecipient;
+
+const engine = createWhisk({ chains: ["Arc_Testnet", "Base_Sepolia"] });
+
+const max = await engine.maxSendable({
+  sourceChain: "Arc_Testnet",
+  destinationChain: "Base_Sepolia",
+  recipient,
+  adapter,
+});
+
+if (max) {
+  console.log(
+    `Balance ${formatUsdcAmount(max.balance)} USDC, ` +
+      `kept for gas ${formatUsdcAmount(max.gasReserve)} USDC, ` +
+      `sendable ${max.amount} USDC`,
+  );
+}
+```
+
+`maxSendable` also subtracts every fee the payer covers, so its `amount` can go straight into `quote`. It returns `null` when the source wallet is not EVM, since Whisk does not read Solana, Stellar or Starknet balances.
+
+On every other EVM chain gas is a separate native token, the reserve is zero, and Whisk does not check the payer's gas balance; the wallet does.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Quotes and fees" href="/concepts/quotes-and-fees">
+    The subunits behind every quote.
+  </Card>
+  <Card title="Types reference" href="/reference/core/types">
+    `Quote`, `QuoteSubunits` and `MaxSendable` field by field.
+  </Card>
+</CardGroup>

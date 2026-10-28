@@ -1,0 +1,190 @@
+---
+title: WhiskProvider
+description: The root provider that creates the engine, mounts the wallet stacks and applies the theme for every Whisk component and hook.
+---
+
+Every Whisk component and hook reads from a `WhiskProvider` above it. Mount one near the root of your app and pass it the config from `createWhiskConfig`.
+
+```tsx App.tsx
+"use client";
+
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+
+const config = createWhiskConfig({
+  wallets: [evm({ chains: ["Base_Sepolia", "Arc_Testnet"] })],
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config} theme="auto">
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+## Props
+
+<ParamField path="config" type="WhiskClientConfig" required>
+  The object returned by `createWhiskConfig`: wallet factories, chains, fee
+  options and the in-flight store. See [config](/reference/react/config).
+</ParamField>
+
+<ParamField path="theme" type="WhiskThemeInput" default='"light"'>
+  A preset name (`"light"`, `"dark"`, `"wine"`, `"indigo"`, `"emerald"`,
+  `"monochrome"`), `"auto"` to follow `prefers-color-scheme`, a full
+  `WhiskTheme`, or `{ preset, tokens }`. See [theming](/theming/overview).
+</ParamField>
+
+<ParamField path="queryClient" type="QueryClient">
+  A TanStack Query client to use when there is no `QueryClientProvider` above
+  the provider. When one is already in the tree, its client is used and this
+  prop is ignored.
+</ParamField>
+
+<ParamField path="children" type="ReactNode" required>
+  The Whisk components and anything that calls Whisk hooks.
+</ParamField>
+
+## What it sets up
+
+On mount the provider does five things:
+
+1. **Creates the engine.** It calls `createWhisk` from `@usewhisk/core` with your chains, fee settings, RPC URLs and resolver. Without a `resolver` in the config it uses the default one, which resolves ENS names. Without an `inflightStore` it keeps transfers between burn and mint in `localStorage`, so a reload can [resume them](/concepts/recovery). Where `localStorage` cannot be written (server rendering, Safari private mode) it falls back to memory.
+2. **Mounts each wallet ecosystem you listed.** wagmi for `evm()`, the Solana wallet adapter for `solana()`, and Whisk's own Stellar and Starknet contexts for `stellar()` and `starknet()`. An ecosystem that is not in `config.wallets` is not mounted at all.
+3. **Reuses what is already there.** If a `WagmiProvider` sits above it, the provider uses that wagmi config and does not mount its own, so the `evm()` factory's wagmi config goes unused. The same goes for an outer `QueryClientProvider`.
+4. **Applies the theme.** It renders a `<div data-whisk>` around your children. Every `--whisk-*` variable from `styles.css` is scoped to that element. See [how themes resolve](/theming/overview#how-a-theme-is-applied).
+5. **Adds a portal target.** Dialogs and dropdowns (the connect modal, the chain picker) render into an element inside `[data-whisk]`, not into `document.body`, so they keep the widget's theme.
+
+The provider throws a `ConfigError` if `config.wallets` has no wallet factory and there is no outer `WagmiProvider`.
+
+## Several ecosystems
+
+List one factory per ecosystem. `solana()`, `stellar()` and `starknet()` default to their test networks.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+  solana,
+  stellar,
+  starknet,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm(), solana(), stellar(), starknet()],
+  chains: [
+    "Base_Sepolia",
+    "Solana_Devnet",
+    "Stellar_Testnet",
+    "Starknet_Sepolia",
+  ],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config}>
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+Each transfer's network comes from its source chain. Keep mainnet and testnet chains in separate configs; the widget never offers a destination on the other network. See [wallets](/wallets) and [chains](/chains).
+
+## Inside an existing wagmi app
+
+Put `WhiskProvider` inside your own providers. It picks them up instead of mounting its own.
+
+```tsx App.tsx
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WagmiProvider, type Config } from "wagmi";
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+declare const wagmiConfig: Config;
+
+const queryClient = new QueryClient();
+
+const whiskConfig = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base", "Arbitrum"],
+});
+
+export function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <WagmiProvider config={wagmiConfig}>
+        <WhiskProvider config={whiskConfig}>
+          <WhiskSend />
+        </WhiskProvider>
+      </WagmiProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+`createWhiskConfig` still needs at least one wallet factory, so keep `evm()` in the list. Your wagmi config must include the EVM chains you list in `chains`, or the wallet cannot switch to them.
+
+To give Whisk a query client without wrapping your app in `QueryClientProvider`, pass it as a prop:
+
+```tsx App.tsx
+import { QueryClient } from "@tanstack/react-query";
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: 1 } },
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config} queryClient={queryClient}>
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+## One provider per app
+
+The engine is created once, when the provider mounts. Later changes to `config` do not reach it, and the in-flight store, wallet connections and query cache all live as long as that mount.
+
+- Create the config once, at module level, not inside a component.
+- Mount the provider once, high in the tree, not per route or per page. Remounting drops the wallet connection.
+- Do not nest two providers. Each one renders its own `[data-whisk]` element and its own engine.
+
+## Server rendering
+
+`WhiskProvider` and every Whisk component are client components (`"use client"`). In the Next.js App Router, render them from a client component.
+
+- `theme="auto"` switches light and dark with a CSS media query, so the server and the browser render the same markup and nothing flashes on hydration. The other themes are written as attributes and inline variables, which are also the same on both sides.
+- On the server the in-flight store falls back to memory. The browser creates its own store from `localStorage` when the provider mounts there.
+- Wallet libraries expect a browser. If prerendering fails in a wallet SDK, load the widget on the client only (for example with `next/dynamic` and `ssr: false`). See [installation](/installation).
+
+## Related
+
+- [`WhiskSend`](/widget/whisk-send), the widget itself.
+- [`useWhiskContext` and `useWhiskEngine`](/hooks/use-whisk-engine) to reach the engine and config from your own components.
+- [Headless entry](/headless/react-headless): the same provider without components or CSS.

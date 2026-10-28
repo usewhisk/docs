@@ -1,0 +1,154 @@
+---
+title: "createWhisk"
+description: "Build a Whisk engine from a WhiskConfig, with every option, its type, default and effect."
+---
+
+`createWhisk` builds the framework-agnostic engine that quotes, sends, bridges and resumes USDC transfers. `<WhiskProvider>` calls it for you; call it yourself in a non-React app or on a server.
+
+```ts engine.ts
+import { createWhisk } from "@usewhisk/core";
+
+export const engine = createWhisk({
+  chains: ["Base_Sepolia", "Arc_Testnet"],
+});
+```
+
+```ts
+function createWhisk(config: WhiskConfig): WhiskEngine;
+```
+
+It returns a [WhiskEngine](/reference/core/engine). Nothing touches the network until you call a method. The engine is stateless apart from its `inflightStore`, so one engine can serve many payers.
+
+It throws `ConfigError` when `chains` is missing or empty, and when `defaultMetadata` fails [validateMetadata](/reference/core/types#metadata).
+
+`engine.config` holds the config with two defaults filled in: `feeBearer` (`"sender"`) and `useForwarder` (`true`).
+
+## WhiskConfig
+
+```ts engine.ts
+import { createWhisk, createStorageInflightStore } from "@usewhisk/core";
+
+export const engine = createWhisk({
+  chains: ["Base", "Arc", "Ethereum"],
+  feeBearer: "receiver",
+  feePolicy: {
+    value: "0.50",
+    recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1",
+  },
+  defaultMetadata: { storeId: "eu-1" },
+  rpcUrls: {
+    Base: ["https://base.example-rpc.com", "https://mainnet.base.org"],
+    Arc: "https://arc.example-rpc.com",
+  },
+  useForwarder: true,
+  forwarderFeeLevel: "med",
+  inflightStore: createStorageInflightStore(window.localStorage),
+  fetch: (input, init) => fetch(input, init),
+});
+```
+
+<ParamField path="chains" type="Chain[]" required>
+  Chain ids such as `"Base"` or `"Arc_Testnet"`. Must not be empty. The engine
+  only checks that it is non-empty: `quote` and `send` accept any chain id in
+  the registry, whatever this list says. UIs use it to decide what to offer. See
+  [Chains](/chains).
+</ParamField>
+
+<ParamField path="defaultSourceChain" type="Chain">
+  Stored for UIs. The engine does not read it.
+</ParamField>
+
+<ParamField path="defaultDestinationChain" type="Chain">
+  Stored for UIs. The engine does not read it.
+</ParamField>
+
+<ParamField path="token" type="Token">
+  Accepted but unused in 0.3. Quotes take their token from `QuoteParams.token`,
+  which defaults to `"USDC"`, and CCTP only moves USDC. Tracked in
+  [usewhisk/whisk#155](https://github.com/usewhisk/whisk/issues/155).
+</ParamField>
+
+<ParamField path="resolver" type="Resolver">
+  Used by `engine.resolve`. Defaults to `addressResolver`, which accepts raw
+  addresses in the destination chain's format. `@usewhisk/react` passes an
+  address-then-ENS resolver instead. See
+  [Resolver](/reference/core/types#resolvers).
+</ParamField>
+
+<ParamField path="feePolicy" type="FeePolicy">
+  A merchant fee charged to the payer on top of every transfer, split 90% to `recipient` and 10% to the Whisk treasury (`WHISK_TREASURY_ADDRESS`). `value` is a decimal USDC string; `recipient` must be an EVM address or `send` throws `ConfigError`. `bps` is ignored. The fee shows in `quote.fees.entries` as two `"custom"` entries and in `quote.amountIn`, whoever bears the bridge fees.
+
+On an EVM source, the fee goes out as one or two USDC `transfer` calls from the payer's wallet, never before the burn or the same-chain transfer: in one atomic EIP-5792 batch with it when the adapter's `supportsAtomicBatch` says yes, otherwise as separate requests once it has landed. A payer who rejects that later request still gets the transfer. `SendSuccess.customFee` and `SendFailure.customFee` report whether the fee was paid. Solana, Stellar and Starknet sources do not send the fee transfers in 0.3, though their quotes include the fee. See [when the fee is paid](/concepts/quotes-and-fees#when-the-fee-is-paid).
+
+</ParamField>
+
+<ParamField path="feeBearer" type={'"sender" | "receiver"'}>
+  Who absorbs the CCTP protocol fee and the Forwarder fee on a bridge. Defaults to `"sender"` (`DEFAULT_FEE_BEARER`).
+
+- `"sender"`: the burn is grossed up by the fees so the recipient nets at least the requested amount. The payer is debited more than the amount.
+- `"receiver"`: the burn is the requested amount and the recipient nets the amount less fees. `quote` throws `ConfigError` when the fees exceed the amount.
+
+The fee-paid-upfront mode (`quote.feeMode: "upfront"`) is only used with `"sender"`. Same-chain sends have no protocol fees. See [Quotes and fees](/concepts/quotes-and-fees).
+
+</ParamField>
+
+<ParamField path="defaultMetadata" type="WhiskMetadata">
+  Correlation data merged into every `send` and `refund` result. Per-call
+  `metadata` wins on key conflicts. Flat object of `string | number | boolean`,
+  at most 1024 bytes as JSON, no keys starting with `__`. It travels through the
+  payer's browser, so keep personal data out. See [Metadata](/flows/metadata).
+</ParamField>
+
+<ParamField path="rpcUrls" type="Partial<Record<Chain, string | string[]>>">
+  RPC endpoints tried in order before each chain's public defaults. Used for
+  `balance`, `maxSendable`, the pre-send balance check, Arc gas prices, the
+  Standard-transfer minimum fee read on chains that have one, and the source and
+  destination reads during `resume`. Wallet transactions go through the wallet,
+  not these. See [RPC](/rpc).
+</ParamField>
+
+<ParamField path="useForwarder" type="boolean">
+  Lets Circle's Forwarding Service submit the destination mint. Defaults to
+  `true`. Circle forwards only burns from EVM or Solana into an EVM chain that
+  supports forwarding; every other route needs a destination wallet to sign the
+  mint whatever this says. With `false`, every bridge needs a wallet on the
+  destination (the source wallet covers EVM to EVM).
+</ParamField>
+
+<ParamField path="forwarderFeeLevel" type={'"med" | "high"'}>
+  Which of Circle's forwarding fee levels to quote. Defaults to `"high"`, or
+  `"med"` when the destination is Ethereum, where `"high"` costs about 0.30 USDC
+  more. At send time the engine only refuses the quote if Circle's current
+  `"med"` fee no longer fits under the confirmed `maxFee`. Not exposed by the
+  React config yet
+  ([usewhisk/whisk#156](https://github.com/usewhisk/whisk/issues/156)).
+</ParamField>
+
+<ParamField path="inflightStore" type="InflightStore">
+  Where bridges are recorded from before the burn until the mint, so `inflight`
+  and `resume` can find them after a reload. Defaults to
+  `createMemoryInflightStore()`, which lasts as long as the engine. In a
+  browser, pass `createStorageInflightStore(window.localStorage)`. See [Inflight
+  records](/reference/core/types#inflight-records).
+</ParamField>
+
+<ParamField path="fetch" type="typeof fetch">
+  Used for every Iris request and every RPC read the engine makes. Defaults to
+  the global `fetch`. Pass one to route Circle through a proxy or to stub it in
+  tests. Not exposed by the React config yet
+  ([usewhisk/whisk#156](https://github.com/usewhisk/whisk/issues/156)).
+</ParamField>
+
+<ParamField path="appLabel" type="string">
+  Stored on `engine.config`. Nothing in 0.3 reads it.
+</ParamField>
+
+## Network
+
+There is no network option. Each transfer's network (mainnet or testnet) comes from its source chain id: `"Base"` is mainnet, `"Base_Sepolia"` is testnet. A bridge between a mainnet and a testnet chain throws `NetworkMismatchError`.
+
+## Related
+
+- [Engine](/reference/core/engine): the methods on the returned engine.
+- [Headless core engine](/headless/core-engine): a walkthrough without React.
+- [Server use](/headless/server): running the engine on a server.

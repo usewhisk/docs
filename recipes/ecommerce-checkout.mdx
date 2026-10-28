@@ -1,0 +1,140 @@
+---
+title: E-commerce checkout
+description: A storefront whose payment step is a WhiskSend locked to the cart total, the merchant address and one chain.
+---
+
+The `ecommerce-checkout` example is a Next.js 15 storefront for a fictional
+brand, Atelier Hibiscus: a product grid, a cart, a checkout page and an order
+confirmation. At the payment step every value the payer could change is
+locked:
+
+```tsx payment-aside.tsx
+"use client";
+
+import { WhiskSend } from "@usewhisk/react";
+
+const MERCHANT_ADDRESS = "0x5B8ecaB7096F8aBED873D246629ef9f05f467605";
+
+export function PaymentAside({
+  totalStr,
+  onPaid,
+}: {
+  totalStr: string;
+  onPaid: (txHash?: string) => void;
+}) {
+  return (
+    <WhiskSend
+      amount={totalStr}
+      recipient={MERCHANT_ADDRESS}
+      sourceChain="Base_Sepolia"
+      destinationChain="Base_Sepolia"
+      onSuccess={({ finalTxHash }) => onPaid(finalTxHash)}
+    />
+  );
+}
+```
+
+`totalStr` is the cart total formatted to two decimals, such as `"184.00"`.
+This is `src/components/checkout/payment-aside.tsx` without its layout.
+
+## How it works
+
+- **Locked payment.** `amount`, `recipient`, `sourceChain` and
+  `destinationChain` are all controlled, so the payer can neither edit the
+  price nor pick a chain. Source and destination are the same, so this is a
+  same-chain USDC transfer on Base Sepolia: no CCTP, no bridge fees, and the
+  merchant receives exactly the total.
+- **Confirmation.** `onSuccess` hands `finalTxHash` (the transfer's hash) to
+  `src/app/checkout.tsx`, which copies the cart into a paid order and shows the
+  confirmation.
+- **Client only.** `src/app/client-gate.tsx` loads the provider and the checkout
+  with `next/dynamic` and `ssr: false`, because the wallet libraries need
+  `window`.
+- **Themed.** `src/app/globals.css` sets the `--whisk-*` variables on
+  `[data-whisk]` to the store's palette. See [theming](/theming/tokens).
+
+The provider, from `src/app/providers.tsx`:
+
+```tsx providers.tsx
+"use client";
+
+import { useMemo, type ReactNode } from "react";
+import { WhiskProvider, createWhiskConfig, evm } from "@usewhisk/react";
+
+export function Providers({ children }: { children: ReactNode }) {
+  const config = useMemo(
+    () =>
+      createWhiskConfig({
+        feeBearer: "sender",
+        wallets: [
+          evm({
+            chains: ["Arc_Testnet", "Base_Sepolia"],
+            projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID,
+            appName: "Atelier Hibiscus",
+          }),
+        ],
+        chains: ["Arc_Testnet", "Base_Sepolia"],
+        defaultSourceChain: "Arc_Testnet",
+        defaultDestinationChain: "Arc_Testnet",
+        appLabel: "whisk-example-ecommerce",
+      }),
+    [],
+  );
+
+  return (
+    <WhiskProvider config={config} theme="light">
+      {children}
+    </WhiskProvider>
+  );
+}
+```
+
+`feeBearer: "sender"` only matters for a bridge. The widget's locked chains
+override the config defaults.
+
+## Run it locally
+
+From a clone of [usewhisk/whisk](https://github.com/usewhisk/whisk), with Node
+20 or later and pnpm:
+
+```bash
+pnpm install
+pnpm build
+cp examples/ecommerce-checkout/.env.example examples/ecommerce-checkout/.env.local
+pnpm --filter @usewhisk/example-ecommerce-checkout dev
+```
+
+Open http://localhost:3010, add something to the cart and check out. You need
+testnet USDC and a little ETH for gas on Base Sepolia.
+
+| Variable                               | Required | Effect                                                                                         |
+| -------------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` | No       | Adds the WalletConnect connector. Without it, injected wallets and Coinbase Wallet still work. |
+
+To move it into your own Next.js app, install `@usewhisk/react`, import
+`@usewhisk/react/styles.css` in the root layout before your own CSS, and copy
+the `webpack` block from `next.config.ts`, which stubs two wagmi dependencies
+that have no browser build.
+
+## For production
+
+The example is a front end only. Before it takes real money:
+
+- **Create the order on your server first.** The example makes an order id
+  after payment, in the browser (`makeOrderId`), so nothing ties the payment to
+  an order. Create the order, with its price and merchant address, before
+  showing the widget.
+- **Verify on your server before fulfilling.** Post `finalTxHash` with the
+  order id and check the USDC transfer on chain, as in
+  [checkout](/flows/checkout#verify-on-your-server). Whisk 0.3 does not notify
+  your server. The example's README mentions a webhook; there is none.
+- **Switch to a mainnet chain.** Replace `Base_Sepolia` with `Base` (or your
+  settlement chain) in both the config and the widget.
+- **Accept other chains if you want them.** To let payers pay from any chain
+  and settle on yours, drop `sourceChain`, keep `destinationChain`, and pass
+  `tabs={["bridge"]}`. The payer then pays the bridge fees on top.
+- **Fix the explorer link.** `src/lib/order.ts` links every hash to Arc
+  Testnet's explorer, though the payment is on Base Sepolia. Use
+  `explorerTxUrl(chain, hash)`.
+- **Remove the "Built on Circle App Kit" footer**, which is left over from
+  Whisk 0.1.

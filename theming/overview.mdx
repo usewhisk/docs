@@ -1,0 +1,202 @@
+---
+title: Theming
+description: Pick a preset, follow the visitor's color scheme, or restyle the widget with tokens and your own CSS.
+---
+
+The widget's look comes from `--whisk-*` CSS variables. Choose a theme with the `theme` prop on [`WhiskProvider`](/widget/whisk-provider), then adjust it with tokens or a stylesheet.
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+import "@usewhisk/react/styles.css";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider config={config} theme="indigo">
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+`@usewhisk/react/styles.css` is required. It holds the component styles and the light and dark palettes. Import it once, anywhere in your app.
+
+## The `theme` prop
+
+| Value                 | Result                                                               |
+| --------------------- | -------------------------------------------------------------------- |
+| `"light"` (default)   | Cream and wine, terracotta accent.                                   |
+| `"dark"`              | The same palette on a dark wine background.                          |
+| `"auto"`              | Light or dark from the visitor's `prefers-color-scheme`.             |
+| `"wine"`              | Light, deep wine accent on warm white.                               |
+| `"indigo"`            | Light, indigo accent.                                                |
+| `"emerald"`           | Light, emerald accent.                                               |
+| `"monochrome"`        | Light, black and white.                                              |
+| `{ preset, tokens }`  | A preset (or `"auto"`) with some [tokens](/theming/tokens) replaced. |
+| a `WhiskTheme` object | Your own palette, every required color given.                        |
+
+The default is `"light"`, not `"auto"`: the widget does not follow the operating system unless you ask it to.
+
+`themePresets` holds the six presets as `WhiskTheme` objects, `getThemePreset(name)` returns one, and `listThemeNames()` returns their names (`"light"`, `"dark"`, `"wine"`, `"indigo"`, `"emerald"`, `"monochrome"`). `"auto"` is not a preset, so it is not in that list.
+
+```tsx ThemePicker.tsx
+import { useState } from "react";
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+  listThemeNames,
+  type WhiskThemeName,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function ThemePicker() {
+  const [theme, setTheme] = useState<WhiskThemeName>("light");
+  return (
+    <>
+      <select
+        value={theme}
+        onChange={(e) => setTheme(e.target.value as WhiskThemeName)}
+      >
+        {listThemeNames().map((name) => (
+          <option key={name}>{name}</option>
+        ))}
+      </select>
+      <WhiskProvider config={config} theme={theme}>
+        <WhiskSend />
+      </WhiskProvider>
+    </>
+  );
+}
+```
+
+The `theme` prop can change at any time; only `config` is fixed at mount.
+
+## How a theme is applied
+
+The provider renders a `<div data-whisk>` around your components. What it puts on that element depends on the theme:
+
+| Theme                                              | `data-whisk-theme` | `class`         | Inline variables                      |
+| -------------------------------------------------- | ------------------ | --------------- | ------------------------------------- |
+| `"light"`                                          | `light`            |                 | none                                  |
+| `"dark"`                                           | `dark`             | `dark`          | none                                  |
+| `"auto"`                                           | not set            |                 | none                                  |
+| `"wine"`, `"indigo"`, `"emerald"`, `"monochrome"`  | `light`            |                 | every color of the preset             |
+| `{ preset: "light" or "dark", tokens }`            | from the preset    | `dark` for dark | the tokens you passed                 |
+| `{ preset: "auto", tokens }`                       | not set            |                 | the tokens you passed                 |
+| `{ preset: "indigo", tokens }` (any named palette) | `light`            |                 | the preset's colors, then your tokens |
+| a `WhiskTheme` object                              | its `colorMode`    | `dark` for dark | every token it sets                   |
+
+Light and dark live in `styles.css`. The light palette is the default on `[data-whisk]`. The dark palette applies in two ways: under `@media (prefers-color-scheme: dark)` when `data-whisk-theme` is not `light` (this is how `"auto"` works), and whenever `data-whisk-theme="dark"` or the `dark` class is present. Because `"auto"` is plain CSS, the server and the browser render the same markup and nothing flashes on hydration.
+
+The named palettes are not in the stylesheet, so the provider writes their colors as inline `style` variables. Tokens you pass are written inline too. Inline styles beat any stylesheet rule.
+
+`resolveTheme(theme)` returns exactly what the provider applies: `{ colorMode, vars }`, or `null` for `"auto"`.
+
+## Overriding with your own stylesheet
+
+For `"light"`, `"dark"` and `"auto"`, nothing is inline, so a rule on `[data-whisk]` in a stylesheet loaded after `styles.css` wins. Every palette block in `styles.css` has the specificity of `[data-whisk]` alone, so one plain rule overrides both light and dark:
+
+```css app.css
+[data-whisk] {
+  --whisk-primary: #2b3cff;
+  --whisk-primary-fg: #ffffff;
+  --whisk-radius-lg: 0.75rem;
+}
+```
+
+To give dark mode its own values, add a more specific rule for each way dark can apply:
+
+```css app.css
+[data-whisk] {
+  --whisk-primary: #2b3cff;
+}
+
+[data-whisk][data-whisk-theme="dark"] {
+  --whisk-primary: #8b95ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-whisk]:not([data-whisk-theme="light"]) {
+    --whisk-primary: #8b95ff;
+  }
+}
+```
+
+The first rule covers light. The second covers `theme="dark"`. The media query covers `theme="auto"` on a dark system. If you only ever use one of `"light"`, `"dark"` or `"auto"`, keep only the rules it needs.
+
+<Warning>
+  A stylesheet cannot override a value the provider writes inline. With
+  `"wine"`, `"indigo"`, `"emerald"` or `"monochrome"`, with a `WhiskTheme`
+  object, and for any token you pass in `{ preset, tokens }`, change the value
+  through the `theme` prop instead.
+</Warning>
+
+## Tokens from the prop
+
+`{ preset, tokens }` changes a few values and keeps the rest of the preset. With `preset: "auto"` the tokens apply in both light and dark:
+
+```tsx App.tsx
+import {
+  WhiskProvider,
+  WhiskSend,
+  createWhiskConfig,
+  evm,
+} from "@usewhisk/react";
+
+const config = createWhiskConfig({
+  wallets: [evm()],
+  chains: ["Base_Sepolia"],
+});
+
+export function App() {
+  return (
+    <WhiskProvider
+      config={config}
+      theme={{
+        preset: "auto",
+        tokens: { primary: "#2b3cff", radiusLg: "0.5rem" },
+      }}
+    >
+      <WhiskSend />
+    </WhiskProvider>
+  );
+}
+```
+
+Because tokens are inline, they are the same in light and dark. For a color that should differ between the two, use the stylesheet rules above. See [tokens](/theming/tokens) for every variable.
+
+## Dark mode in your own markup
+
+With `theme="dark"`, the widget root carries the `dark` class, so Tailwind's class-based `dark:` variants work inside it. See [Tailwind](/theming/tailwind).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Tokens" href="/theming/tokens">
+    Every `--whisk-*` variable and what it colors.
+  </Card>
+  <Card title="Tailwind" href="/theming/tailwind">
+    Use the variables as Tailwind classes.
+  </Card>
+  <Card title="Fonts" href="/theming/fonts">
+    The default font stack, and using your own.
+  </Card>
+  <Card title="Themed SaaS recipe" href="/recipes/themed-saas">
+    A full example with a brand palette.
+  </Card>
+</CardGroup>
